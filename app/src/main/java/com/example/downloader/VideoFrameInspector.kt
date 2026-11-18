@@ -134,6 +134,8 @@ class VideoFrameInspector(private val context: Context) {
                     combinedEnergy = combinedEnergy
                 )
             }
+        } catch (e: Exception) {
+            android.util.Log.w("VideoFrameInspector", "Frame sampling skipped cleanly", e)
         } finally {
             runCatching { retriever.release() }
         }

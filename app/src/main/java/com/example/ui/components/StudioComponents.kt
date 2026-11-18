@@ -30,7 +30,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -42,6 +45,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
@@ -92,6 +96,7 @@ fun StudioVideoPlayer(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    var playerErrorMsg by remember(filePath) { mutableStateOf<String?>(null) }
     val player = remember(filePath) {
         val mediaUri = if (filePath.startsWith("http://", true) || filePath.startsWith("https://", true)) {
             Uri.parse(filePath)
@@ -100,6 +105,11 @@ fun StudioVideoPlayer(
         }
         ExoPlayer.Builder(context).build().apply {
             repeatMode = Player.REPEAT_MODE_ONE
+            addListener(object : Player.Listener {
+                override fun onPlayerError(error: PlaybackException) {
+                    playerErrorMsg = "تعذر تشغيل المعاينة المباشرة (${error.errorCodeName}) — يمكنك المتابعة في التصدير."
+                }
+            })
             setMediaItem(MediaItem.fromUri(mediaUri))
             prepare()
         }
@@ -227,6 +237,24 @@ fun StudioVideoPlayer(
                     text = "TIMECODE",
                     style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFontFamily),
                     color = ElectricCyan
+                )
+            }
+        }
+
+        if (!playerErrorMsg.isNullOrBlank()) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .padding(16.dp)
+                    .background(ObsidianBg.copy(alpha = 0.9f), RoundedCornerShape(12.dp))
+                    .border(1.dp, StudioBorder, RoundedCornerShape(12.dp))
+                    .padding(12.dp)
+            ) {
+                Text(
+                    text = playerErrorMsg!!,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.White,
+                    textAlign = TextAlign.Center
                 )
             }
         }

@@ -54,26 +54,47 @@ class VideoDownloadEngine(
 
     fun inspectAndDownload(rawUrl: String): Flow<DownloadState> = flow {
         emit(DownloadState.Inspecting(rawUrl, "جاري فحص الرابط والتحقق من مسار الفيديو..."))
-        val initialInspection = linkInspector.inspectUrl(rawUrl)
+        try {
+            val initialInspection = linkInspector.inspectUrl(rawUrl)
 
-        if (initialInspection.isHlsStream) {
-            emit(DownloadState.Verifying(initialInspection))
-            val techInfo = frameInspector.inspectRemoteStream(initialInspection.resolvedVideoUrl, initialInspection.title)
+            if (initialInspection.isHlsStream) {
+                emit(DownloadState.Verifying(initialInspection))
+                val techInfo = frameInspector.inspectRemoteStream(
+                    initialInspection.resolvedVideoUrl,
+                    initialInspection.title
+                )
+                emit(
+                    DownloadState.Completed(
+                        filePath = initialInspection.resolvedVideoUrl,
+                        inspection = initialInspection,
+                        technicalInfo = techInfo
+                    )
+                )
+                return@flow
+            }
+
+            downloadWithRecovery(
+                inspection = initialInspection,
+                referer = initialInspection.originalUrl,
+                allowHtmlRecovery = true
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: VideoLinkException) {
             emit(
-                DownloadState.Completed(
-                    filePath = initialInspection.resolvedVideoUrl,
-                    inspection = initialInspection,
-                    technicalInfo = techInfo
+                DownloadState.Error(
+                    message = e.message ?: "تعذر فحص رابط الفيديو",
+                    diagnosticDetail = e.diagnosticDetail
                 )
             )
-            return@flow
+        } catch (e: Exception) {
+            emit(
+                DownloadState.Error(
+                    message = "تعذر فحص الرابط: ${e.localizedMessage ?: "تأكد من اتصالك بالإنترنت وصحة الرابط"}",
+                    diagnosticDetail = e.javaClass.simpleName
+                )
+            )
         }
-
-        downloadWithRecovery(
-            inspection = initialInspection,
-            referer = initialInspection.originalUrl,
-            allowHtmlRecovery = true
-        )
     }.flowOn(Dispatchers.IO)
 
     private suspend fun FlowCollector<DownloadState>.downloadWithRecovery(

@@ -249,8 +249,15 @@ fun StudioLinkScreen(
                                     }
                                     IconButton(
                                         onClick = {
-                                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                            val pasted = clipboard.primaryClip?.getItemAt(0)?.text?.toString().orEmpty()
+                                            val pasted = runCatching {
+                                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                                clipboard.primaryClip
+                                                    ?.takeIf { it.itemCount > 0 }
+                                                    ?.getItemAt(0)
+                                                    ?.coerceToText(context)
+                                                    ?.toString()
+                                                    .orEmpty()
+                                            }.getOrDefault("")
                                             if (pasted.isNotBlank()) {
                                                 onUrlChange(pasted.trim())
                                             }

@@ -36,6 +36,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.io.File
@@ -199,12 +200,23 @@ class ClipCraftViewModel(application: Application) : AndroidViewModel(applicatio
                     aiAnalysisState = AiAnalysisState.Idle
                 )
             }
-            downloadEngine.inspectAndDownload(targetUrl).collect { state ->
-                _uiState.update { it.copy(downloadState = state) }
-                if (state is DownloadState.Completed) {
-                    onVideoReady(state.inspection, state.technicalInfo)
+            downloadEngine.inspectAndDownload(targetUrl)
+                .catch { e ->
+                    if (e is CancellationException) throw e
+                    Log.e(TAG, "Link inspection flow error", e)
+                    emit(
+                        DownloadState.Error(
+                            message = e.localizedMessage ?: "تعذر فحص رابط الفيديو",
+                            diagnosticDetail = e.javaClass.simpleName
+                        )
+                    )
                 }
-            }
+                .collect { state ->
+                    _uiState.update { it.copy(downloadState = state) }
+                    if (state is DownloadState.Completed) {
+                        onVideoReady(state.inspection, state.technicalInfo)
+                    }
+                }
         }
     }
 
@@ -224,12 +236,18 @@ class ClipCraftViewModel(application: Application) : AndroidViewModel(applicatio
                     aiAnalysisState = AiAnalysisState.Idle
                 )
             }
-            downloadEngine.importLocalUri(uri).collect { state ->
-                _uiState.update { it.copy(downloadState = state) }
-                if (state is DownloadState.Completed) {
-                    onVideoReady(state.inspection, state.technicalInfo)
+            downloadEngine.importLocalUri(uri)
+                .catch { e ->
+                    if (e is CancellationException) throw e
+                    Log.e(TAG, "Local import flow error", e)
+                    emit(DownloadState.Error(e.localizedMessage ?: "تعذر استيراد الفيديو من الجهاز"))
                 }
-            }
+                .collect { state ->
+                    _uiState.update { it.copy(downloadState = state) }
+                    if (state is DownloadState.Completed) {
+                        onVideoReady(state.inspection, state.technicalInfo)
+                    }
+                }
         }
     }
 
@@ -247,12 +265,14 @@ class ClipCraftViewModel(application: Application) : AndroidViewModel(applicatio
             val metrics = if (technicalInfo.isRemoteHlsStream) {
                 emptyList()
             } else {
-                frameInspector.sampleFramesAndEnergy(
-                    filePath = technicalInfo.filePath,
-                    projectId = projectId,
-                    durationMs = technicalInfo.durationMs,
-                    sampleCount = 12
-                )
+                runCatching {
+                    frameInspector.sampleFramesAndEnergy(
+                        filePath = technicalInfo.filePath,
+                        projectId = projectId,
+                        durationMs = technicalInfo.durationMs,
+                        sampleCount = 12
+                    )
+                }.getOrDefault(emptyList())
             }
             _uiState.update {
                 it.copy(

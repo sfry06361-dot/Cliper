@@ -6,11 +6,15 @@ import kotlinx.coroutines.withContext
 import okhttp3.Cookie
 import okhttp3.CookieJar
 import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.URI
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 
 class VideoLinkException(
@@ -19,37 +23,37 @@ class VideoLinkException(
 ) : Exception(message)
 
 /**
- * In-memory cookie store so redirects, Drive confirmation pages, and CDN hotlink checks
- * keep their session cookies between inspection and download.
+ * RFC-compliant in-memory cookie store using OkHttp Cookie.matches(url)
+ * so parent-domain cookies (e.g. .tiktok.com, .google.com, .youtube.com)
+ * carry over cleanly to CDN subdomains during inspection and download.
  */
 class SessionCookieJar : CookieJar {
-    private val store = ConcurrentHashMap<String, MutableList<Cookie>>()
+    private val cookies = CopyOnWriteArrayList<Cookie>()
 
     override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
         if (cookies.isEmpty()) return
-        val existing = store.getOrPut(url.host) { mutableListOf() }
-        synchronized(existing) {
-            cookies.forEach { incoming ->
-                existing.removeAll { it.name == incoming.name && it.path == incoming.path }
-                existing.add(incoming)
+        for (incoming in cookies) {
+            this.cookies.removeAll {
+                it.name == incoming.name && it.domain == incoming.domain && it.path == incoming.path
             }
+            this.cookies.add(incoming)
         }
     }
 
     override fun loadForRequest(url: HttpUrl): List<Cookie> {
         val now = System.currentTimeMillis()
-        val existing = store[url.host] ?: return emptyList()
-        return synchronized(existing) {
-            existing.removeAll { it.expiresAt < now }
-            existing.toList()
-        }
+        cookies.removeAll { it.expiresAt < now }
+        return cookies.filter { it.matches(url) }
     }
 }
 
 /**
  * Self-contained link inspector packaged inside the application source tree.
- * Rewrites cloud-share links (Drive/Dropbox/GitHub), extracts candidate streams from HTML,
- * and verifies actual stream bytes (Range 0-127) before accepting a URL as downloadable video.
+ * - Extracts URLs cleanly from mobile share-sheet text (YouTube, TikTok, etc.)
+ * - Rewrites cloud-share links (Drive/Dropbox/GitHub)
+ * - Attempts direct stream resolution for YouTube & TikTok public videos
+ * - Scrapes HTML/JSON media tags & verifies actual stream bytes (Range 0-255)
+ * - Never throws uncaught exceptions out of normal invalid-URL or protection paths
  */
 class VideoLinkInspector(
     private val client: OkHttpClient = sharedOkHttpClient
@@ -58,8 +62,28 @@ class VideoLinkInspector(
     suspend fun inspectUrl(rawUrl: String): LinkInspectionResult = withContext(Dispatchers.IO) {
         val normalized = rewriteKnownHostingUrl(normalizeUrl(rawUrl))
 
+        // Validate final URL for OkHttp safety so malformed characters never crash
+        val parsedHttpUrl = normalized.toHttpUrlOrNull()
+            ?: throw VideoLinkException(
+                message = "صيغة الرابط غير صالحة أو تحتوي على رموز غير مدعومة.",
+                diagnosticDetail = "تأكد من نسخ رابط الفيديو الصحيح بدون مسافات زائدة."
+            )
+
+        val host = parsedHttpUrl.host.lowercase()
+
+        // 1. Specialized resolver for YouTube (watch, shorts, youtu.be, live)
+        if (isYouTubeHost(host)) {
+            extractYouTubeStream(parsedHttpUrl.toString(), rawUrl.trim())?.let { return@withContext it }
+        }
+
+        // 2. Specialized resolver for TikTok (tiktok.com, vm.tiktok.com, vt.tiktok.com)
+        if (isTikTokHost(host)) {
+            extractTikTokStream(parsedHttpUrl.toString(), rawUrl.trim())?.let { return@withContext it }
+        }
+
+        // 3. Direct request + generic HTML/JSON stream extraction
         val request = Request.Builder()
-            .url(normalized)
+            .url(parsedHttpUrl)
             .header("User-Agent", BROWSER_USER_AGENT)
             .header("Accept", "video/*,application/xhtml+xml,text/html;q=0.9,*/*;q=0.8")
             .header("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
@@ -71,7 +95,7 @@ class VideoLinkInspector(
             val statusCode = response.code
             if (!response.isSuccessful) {
                 throw VideoLinkException(
-                    message = "تعذر الوصول للرابط (رمز HTTP $statusCode)",
+                    message = buildPlatformHttpErrorMessage(host, statusCode),
                     diagnosticDetail = "URL: $finalUrl | HTTP $statusCode ${response.message}"
                 )
             }
@@ -84,7 +108,6 @@ class VideoLinkInspector(
             val contentLength = response.header("Content-Length")?.toLongOrNull() ?: -1L
             val bodyStream = response.body?.byteStream()
 
-            // Peek initial bytes to distinguish real video/HLS from HTML error pages
             val peekBytes = readBoundedBytes(bodyStream, maxBytes = 512)
             val peekText = peekBytes.toString(Charsets.ISO_8859_1).trimStart()
             val looksHtml = peekText.startsWith("<!doctype", true) ||
@@ -121,7 +144,6 @@ class VideoLinkInspector(
                 )
             }
 
-            // Read remaining HTML up to 512KB for deep stream extraction
             val restHtml = readBoundedBytes(bodyStream, maxBytes = 512 * 1024 - peekBytes.size)
             val html = (peekBytes + restHtml).toString(Charsets.UTF_8)
 
@@ -152,10 +174,214 @@ class VideoLinkInspector(
             }
 
             throw VideoLinkException(
-                message = "هذا الرابط يعرض صفحة ويب أو مشغّلاً محمياً ولا يتيح ملف فيديو قابلاً للتنزيل المباشر.",
-                diagnosticDetail = "الموقع ($finalUrl) لم يُرجع مسار MP4/WebM/HLS مفتوحاً في الصفحة. انسخ رابط الفيديو المباشر (.mp4) أو اختر الفيديو من جهازك."
+                message = buildProtectedPlatformMessage(host),
+                diagnosticDetail = "الموقع ($finalUrl) لم يُرجع مسار فيديو مباشراً (MP4/HLS). يمكنك اختيار الفيديو من زر «من الجهاز» أو لصق رابط ملف فيديو مباشر."
             )
         }
+    }
+
+    private fun extractYouTubeStream(url: String, originalRaw: String): LinkInspectionResult? {
+        val videoId = parseYouTubeVideoId(url) ?: return null
+
+        // Try official InnerTube player payloads (IOS & ANDROID_VR often return direct/HLS streams)
+        val clientConfigs = listOf(
+            Triple("IOS", "19.29.1", "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"),
+            Triple("ANDROID_VR", "1.56.21", "com.google.android.apps.youtube.vr.oculus/1.56.21 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip")
+        )
+
+        for ((clientName, clientVersion, ua) in clientConfigs) {
+            val result = runCatching {
+                val payload = JSONObject().apply {
+                    put("videoId", videoId)
+                    put("context", JSONObject().apply {
+                        put("client", JSONObject().apply {
+                            put("clientName", clientName)
+                            put("clientVersion", clientVersion)
+                            put("hl", "ar")
+                            put("gl", "EG")
+                        })
+                    })
+                    put("contentCheckOk", true)
+                    put("racyCheckOk", true)
+                }
+
+                val req = Request.Builder()
+                    .url("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+                    .header("User-Agent", ua)
+                    .header("Content-Type", "application/json")
+                    .header("Origin", "https://www.youtube.com")
+                    .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                    .build()
+
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@runCatching null
+                    val bodyStr = resp.body?.string().orEmpty()
+                    if (bodyStr.isBlank()) return@runCatching null
+                    val json = JSONObject(bodyStr)
+                    parseYouTubePlayerJson(json, url, originalRaw, ua)
+                }
+            }.getOrNull()
+
+            if (result != null) return result
+        }
+
+        // Fallback: parse ytInitialPlayerResponse from HTML watch page
+        val htmlResult = runCatching {
+            val req = Request.Builder()
+                .url("https://www.youtube.com/watch?v=$videoId&has_verified=1")
+                .header("User-Agent", BROWSER_USER_AGENT)
+                .header("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
+                .get()
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@runCatching null
+                val html = readBoundedBytes(resp.body?.byteStream(), 900 * 1024).toString(Charsets.UTF_8)
+                val match = Regex("""ytInitialPlayerResponse\s*=\s*(\{.+?\})\s*;(?:\s*var|\s*</script>)""", RegexOption.DOT_MATCHES_ALL)
+                    .find(html) ?: return@runCatching null
+                val json = JSONObject(match.groupValues[1])
+                parseYouTubePlayerJson(json, url, originalRaw, BROWSER_USER_AGENT)
+            }
+        }.getOrNull()
+
+        if (htmlResult != null) return htmlResult
+
+        throw VideoLinkException(
+            message = "يوتيوب يفرض تشفيراً أو تحققاً أمنياً (Bot/Signature Protection) على هذا الفيديو.",
+            diagnosticDetail = "تم حماية التطبيق من الإغلاق: روابط يوتيوب المشفرة لا تسمح بالتنزيل المباشر بدون خادم وسيط. يمكنك حفظ المقطع أو اختياره عبر زر «من الجهاز» للمونتاج الفوري."
+        )
+    }
+
+    private fun parseYouTubePlayerJson(
+        json: JSONObject,
+        pageUrl: String,
+        originalRaw: String,
+        userAgent: String
+    ): LinkInspectionResult? {
+        val videoDetails = json.optJSONObject("videoDetails")
+        val title = videoDetails?.optString("title")?.takeIf { it.isNotBlank() } ?: "فيديو يوتيوب"
+        val thumb = videoDetails?.optJSONObject("thumbnail")
+            ?.optJSONArray("thumbnails")
+            ?.let { arr -> if (arr.length() > 0) arr.optJSONObject(arr.length() - 1)?.optString("url") else null }
+
+        val streamingData = json.optJSONObject("streamingData") ?: return null
+        val formats = streamingData.optJSONArray("formats")
+
+        if (formats != null) {
+            val directUrls = mutableListOf<Pair<Int, String>>()
+            for (i in 0 until formats.length()) {
+                val fmt = formats.optJSONObject(i) ?: continue
+                val directUrl = fmt.optString("url")
+                val height = fmt.optInt("height", 360)
+                if (directUrl.isNotBlank() && looksLikeHttpUrl(directUrl)) {
+                    directUrls += height to directUrl
+                }
+            }
+            for ((_, candidate) in directUrls.sortedByDescending { it.first }) {
+                val verified = probeCandidateStream(candidate, referer = "https://www.youtube.com/", userAgent = userAgent)
+                if (verified != null) {
+                    return LinkInspectionResult(
+                        originalUrl = originalRaw,
+                        resolvedVideoUrl = verified.finalUrl,
+                        title = title,
+                        contentType = verified.contentType,
+                        contentLengthBytes = verified.contentLength,
+                        isDirectVideo = !verified.isHls,
+                        extractedFromHtml = true,
+                        isHlsStream = verified.isHls,
+                        thumbnailUrl = thumb,
+                        httpStatus = verified.statusCode,
+                        inspectionNotes = "تم استخراج بث الفيديو المباشر من يوتيوب بنجاح."
+                    )
+                }
+            }
+        }
+
+        val hlsUrl = streamingData.optString("hlsManifestUrl")
+        if (hlsUrl.isNotBlank() && looksLikeHttpUrl(hlsUrl)) {
+            val verified = probeCandidateStream(hlsUrl, referer = "https://www.youtube.com/", userAgent = userAgent)
+            if (verified != null) {
+                return LinkInspectionResult(
+                    originalUrl = originalRaw,
+                    resolvedVideoUrl = verified.finalUrl,
+                    title = title,
+                    contentType = verified.contentType,
+                    contentLengthBytes = verified.contentLength,
+                    isDirectVideo = false,
+                    extractedFromHtml = true,
+                    isHlsStream = true,
+                    thumbnailUrl = thumb,
+                    httpStatus = verified.statusCode,
+                    inspectionNotes = "تم استخراج بث HLS مباشر من يوتيوب."
+                )
+            }
+        }
+        return null
+    }
+
+    private fun extractTikTokStream(url: String, originalRaw: String): LinkInspectionResult? {
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", DESKTOP_USER_AGENT)
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
+            .get()
+            .build()
+
+        val extracted = runCatching {
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@runCatching null
+                val finalPageUrl = resp.request.url.toString()
+                val html = readBoundedBytes(resp.body?.byteStream(), 800 * 1024).toString(Charsets.UTF_8)
+
+                val candidateUrls = LinkedHashSet<String>()
+                // Try JSON keys used by TikTok __UNIVERSAL_DATA_FOR_REHYDRATION__ / SIGI_STATE
+                val ttRegex = Regex(
+                    """["'](?:playAddr|downloadAddr|PlayUrl|play_url)["']\s*:\s*["'](https?:[^"']+)["']""",
+                    RegexOption.IGNORE_CASE
+                )
+                ttRegex.findAll(html).forEach { m ->
+                    val decoded = unescapeJsonUrl(m.groupValues[1])
+                    if (looksLikeHttpUrl(decoded)) candidateUrls += decoded
+                }
+
+                // Fallback to general URL extraction (urlList arrays, og:video, etc.)
+                candidateUrls += extractAllCandidateUrls(html, finalPageUrl)
+
+                val title = extractHtmlTitle(html)?.takeIf { it.isNotBlank() } ?: "فيديو تيك توك"
+                val thumb = extractMetaContent(html, "og:image")
+
+                for (candidate in candidateUrls) {
+                    val verified = probeCandidateStream(
+                        candidateUrl = candidate,
+                        referer = "https://www.tiktok.com/",
+                        userAgent = DESKTOP_USER_AGENT
+                    )
+                    if (verified != null) {
+                        return@runCatching LinkInspectionResult(
+                            originalUrl = originalRaw,
+                            resolvedVideoUrl = verified.finalUrl,
+                            title = title,
+                            contentType = verified.contentType,
+                            contentLengthBytes = verified.contentLength,
+                            isDirectVideo = !verified.isHls,
+                            extractedFromHtml = true,
+                            isHlsStream = verified.isHls,
+                            thumbnailUrl = thumb,
+                            httpStatus = verified.statusCode,
+                            inspectionNotes = "تم استخراج فيديو تيك توك والتحقق من مساره بنجاح."
+                        )
+                    }
+                }
+                null
+            }
+        }.getOrNull()
+
+        if (extracted != null) return extracted
+
+        throw VideoLinkException(
+            message = "تيك توك يفرض تحقق أمان (Captcha / Cookie Protection) على هذا الرابط.",
+            diagnosticDetail = "تم منع إغلاق التطبيق بأمان: انسخ رابط الفيديو المباشر أو احفظ مقطع تيك توك على هاتفك واختره من زر «من الجهاز» للمونتاج الفوري."
+        )
     }
 
     fun tryExtractVerifiedVideoFromHtml(html: String, baseUrl: String): LinkInspectionResult? {
@@ -188,11 +414,16 @@ class VideoLinkInspector(
         val isHls: Boolean
     )
 
-    private fun probeCandidateStream(candidateUrl: String, referer: String): VerifiedProbe? {
+    private fun probeCandidateStream(
+        candidateUrl: String,
+        referer: String,
+        userAgent: String = BROWSER_USER_AGENT
+    ): VerifiedProbe? {
         return runCatching {
+            val httpUrl = candidateUrl.toHttpUrlOrNull() ?: return@runCatching null
             val req = Request.Builder()
-                .url(candidateUrl)
-                .header("User-Agent", BROWSER_USER_AGENT)
+                .url(httpUrl)
+                .header("User-Agent", userAgent)
                 .header("Referer", referer)
                 .header("Range", "bytes=0-255")
                 .get()
@@ -244,7 +475,6 @@ class VideoLinkInspector(
     private fun extractAllCandidateUrls(html: String, baseUrl: String): List<String> {
         val candidates = LinkedHashSet<String>()
 
-        // 1. Google Drive virus-scan confirmation form / href
         if (baseUrl.contains("drive.google.com", ignoreCase = true) || baseUrl.contains("docs.google.com", ignoreCase = true)) {
             val actionMatch = Regex("""<form[^>]+id=["']download-form["'][^>]+action=["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(html)
             if (actionMatch != null) {
@@ -264,7 +494,6 @@ class VideoLinkInspector(
             }
         }
 
-        // 2. OpenGraph & Twitter stream meta tags
         listOf("og:video:secure_url", "og:video:url", "og:video", "twitter:player:stream").forEach { key ->
             extractMetaContent(html, key)?.let { raw ->
                 val decoded = decodeHtmlEntities(raw)
@@ -273,14 +502,12 @@ class VideoLinkInspector(
             }
         }
 
-        // 3. HTML5 <video> and <source> tags
         val tagRegex = Regex("""<(?:video|source)[^>]+src\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
         tagRegex.findAll(html).forEach { match ->
             val resolved = resolveRelativeUrl(baseUrl, decodeHtmlEntities(match.groupValues[1]))
             if (looksLikeHttpUrl(resolved)) candidates += resolved
         }
 
-        // 4. JSON / JS embedded stream fields (MP4 / WebM / M3U8)
         val jsonFieldRegex = Regex(
             """["'](?:playable_url_quality_hd|playable_url|contentUrl|video_url|videoUrl|mp4_url|playback_url|hd_src|sd_src|fallback_url|media_url|url|src)["']\s*:\s*["'](https?:[^"']+)["']""",
             RegexOption.IGNORE_CASE
@@ -292,7 +519,6 @@ class VideoLinkInspector(
             }
         }
 
-        // 5. Raw direct media URLs anywhere in page scripts
         val rawMediaRegex = Regex(
             """https?:\\?/\\?/[^\s"'<>\\]+?\.(?:mp4|mov|webm|m4v|m3u8)(?:\?[^\s"'<>\\]*)?""",
             RegexOption.IGNORE_CASE
@@ -306,19 +532,15 @@ class VideoLinkInspector(
     }
 
     private fun rewriteKnownHostingUrl(url: String): String {
-        // Google Drive share link -> direct download endpoint
         val driveFileMatch = Regex("""https?://drive\.google\.com/file/d/([a-zA-Z0-9_-]+)""").find(url)
         if (driveFileMatch != null) {
-            val fileId = driveFileMatch.groupValues[1]
-            return "https://drive.google.com/uc?export=download&id=$fileId"
+            return "https://drive.google.com/uc?export=download&id=${driveFileMatch.groupValues[1]}"
         }
         val driveOpenMatch = Regex("""https?://drive\.google\.com/open\?id=([a-zA-Z0-9_-]+)""").find(url)
         if (driveOpenMatch != null) {
-            val fileId = driveOpenMatch.groupValues[1]
-            return "https://drive.google.com/uc?export=download&id=$fileId"
+            return "https://drive.google.com/uc?export=download&id=${driveOpenMatch.groupValues[1]}"
         }
 
-        // Dropbox dl=0 -> dl=1
         if (url.contains("dropbox.com/", ignoreCase = true)) {
             return when {
                 url.contains("dl=0") -> url.replace("dl=0", "dl=1")
@@ -328,7 +550,6 @@ class VideoLinkInspector(
             }
         }
 
-        // GitHub blob -> raw.githubusercontent
         val ghBlob = Regex("""^https?://github\.com/([^/]+)/([^/]+)/blob/(.+)$""").find(url)
         if (ghBlob != null) {
             val (owner, repo, rest) = ghBlob.destructured
@@ -343,17 +564,62 @@ class VideoLinkInspector(
         if (trimmed.isBlank()) {
             throw VideoLinkException("يرجى إدخال أو لصق رابط الفيديو أولاً.")
         }
-        val withScheme = if (trimmed.startsWith("http://", true) || trimmed.startsWith("https://", true)) {
-            trimmed
+        // Automatically extract the first http/https URL if pasted from TikTok/YouTube share sheets with text around it
+        val extracted = Regex("""https?://[^\s"'<>\]\)]+""", RegexOption.IGNORE_CASE).find(trimmed)?.value
+        val candidate = extracted ?: trimmed
+        val withScheme = if (candidate.startsWith("http://", true) || candidate.startsWith("https://", true)) {
+            candidate
         } else {
-            "https://$trimmed"
+            "https://$candidate"
         }
-        val uri = runCatching { URI(withScheme) }.getOrNull()
-            ?: throw VideoLinkException("صيغة الرابط غير صالحة. تأكد من نسخ الرابط بالكامل.")
-        if (uri.host.isNullOrBlank()) {
-            throw VideoLinkException("الرابط لا يحتوي على اسم نطاق صالح.")
+        val httpUrl = withScheme.toHttpUrlOrNull()
+            ?: run {
+                val uri = runCatching { URI(withScheme) }.getOrNull()
+                if (uri == null || uri.host.isNullOrBlank()) {
+                    throw VideoLinkException(
+                        message = "صيغة الرابط غير صالحة.",
+                        diagnosticDetail = "تأكد من نسخ رابط الفيديو بالكامل (مثال: https://example.com/video.mp4)."
+                    )
+                }
+                throw VideoLinkException(
+                    message = "الرابط يحتوي على أحرف غير صالحة للاتصال.",
+                    diagnosticDetail = "انسخ عنوان الرابط فقط بدون نصوص إضافية."
+                )
+            }
+        return httpUrl.toString()
+    }
+
+    private fun parseYouTubeVideoId(url: String): String? {
+        val patterns = listOf(
+            Regex("""(?:v=|/videos/|embed/|shorts/|live/|youtu\.be/)([a-zA-Z0-9_-]{11})"""),
+            Regex("""[?&]v=([a-zA-Z0-9_-]{11})""")
+        )
+        for (p in patterns) {
+            p.find(url)?.groupValues?.getOrNull(1)?.let { return it }
         }
-        return withScheme
+        return null
+    }
+
+    private fun isYouTubeHost(host: String): Boolean =
+        host.contains("youtube.com") || host.contains("youtu.be") || host.contains("youtube-nocookie.com")
+
+    private fun isTikTokHost(host: String): Boolean =
+        host.contains("tiktok.com") || host.contains("tiktokv.com")
+
+    private fun buildPlatformHttpErrorMessage(host: String, statusCode: Int): String = when {
+        isYouTubeHost(host) -> "يوتيوب رفض الوصول المباشر للفيديو (HTTP $statusCode)."
+        isTikTokHost(host) -> "تيك توك حظر الفحص التلقائي لهذا الرابط (HTTP $statusCode)."
+        statusCode == 403 || statusCode == 401 -> "الخادم منع الوصول إلى الملف (HTTP $statusCode - رابط محمي أو منتهي الصلاحية)."
+        statusCode == 404 -> "الفيديو غير موجود على هذا الرابط (HTTP 404)."
+        else -> "تعذر الوصول للرابط (رمز HTTP $statusCode)."
+    }
+
+    private fun buildProtectedPlatformMessage(host: String): String = when {
+        isYouTubeHost(host) -> "رابط يوتيوب مشفّر ولا يوفر ملف MP4 مباشراً للتنزيل بدون تشفير."
+        isTikTokHost(host) -> "رابط تيك توك محمي بصفحة تحقق ولا يتيح ملف الفيديو المباشر."
+        host.contains("instagram.com") || host.contains("facebook.com") || host.contains("fb.watch") ->
+            "منصات التواصل الاجتماعي تحمي صفحاتها بتسجيل الدخول ولا تتيح ملف فيديو مباشراً."
+        else -> "هذا الرابط يعرض صفحة ويب أو مشغّلاً محمياً ولا يتيح ملف فيديو قابلاً للتنزيل المباشر."
     }
 
     private fun isHlsStream(contentType: String, url: String, peekText: String): Boolean {
@@ -401,6 +667,7 @@ class VideoLinkInspector(
             input.replace("\\/", "/")
                 .replace("\\u0026", "&")
                 .replace("\\u002F", "/")
+                .replace("\\u002f", "/")
                 .replace("\\u003d", "=")
                 .replace("\\u003D", "=")
         )
@@ -435,7 +702,7 @@ class VideoLinkInspector(
             .replace('_', ' ')
             .replace('-', ' ')
             .trim()
-            .takeIf { it.length >= 3 && !it.equals("uc", true) }
+            .takeIf { it.length >= 3 && !it.equals("uc", true) && !it.equals("videoplayback", true) }
             ?: "مشروع فيديو جديد"
     }
 
@@ -456,6 +723,9 @@ class VideoLinkInspector(
     companion object {
         const val BROWSER_USER_AGENT =
             "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+
+        const val DESKTOP_USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
         val sharedOkHttpClient: OkHttpClient by lazy {
             OkHttpClient.Builder()
