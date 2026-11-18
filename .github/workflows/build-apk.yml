@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-apk:
     runs-on: ubuntu-latest
@@ -35,9 +38,22 @@ jobs:
       - name: Build Debug APK
         run: gradle :app:assembleDebug
 
-      - name: Upload ClipCraft APK
+      - name: Prepare ClipCraft APK filename
+        run: cp app/build/outputs/apk/debug/app-debug.apk ClipCraft.apk
+
+      - name: Upload ClipCraft APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ClipCraft-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: ClipCraft-APK
+          path: ClipCraft.apk
           if-no-files-found: error
+
+      - name: Publish APK to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-apk
+          name: ClipCraft APK (أحدث نسخة للتنزيل)
+          files: ClipCraft.apk
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
