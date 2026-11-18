@@ -93,16 +93,21 @@ fun StudioVideoPlayer(
 ) {
     val context = LocalContext.current
     val player = remember(filePath) {
+        val mediaUri = if (filePath.startsWith("http://", true) || filePath.startsWith("https://", true)) {
+            Uri.parse(filePath)
+        } else {
+            Uri.fromFile(File(filePath))
+        }
         ExoPlayer.Builder(context).build().apply {
             repeatMode = Player.REPEAT_MODE_ONE
-            setMediaItem(MediaItem.fromUri(Uri.fromFile(File(filePath))))
+            setMediaItem(MediaItem.fromUri(mediaUri))
             prepare()
         }
     }
 
     LaunchedEffect(quality?.globalSpeed, quality?.removeAudio) {
         if (quality != null) {
-            player.playbackParameters = PlaybackParameters(quality.globalSpeed.coerceIn(0.5f, 2.0f))
+            player.playbackParameters = PlaybackParameters(quality.globalSpeed.coerceIn(0.5f, 2.5f))
             player.volume = if (quality.removeAudio) 0f else 1f
         }
     }
@@ -147,7 +152,7 @@ fun StudioVideoPlayer(
             modifier = Modifier.fillMaxSize()
         )
 
-        // Live preview of burn-in Arabic overlay text positioned identically to export
+        // Live preview of Top/Center/Bottom Hook Banner
         if (details != null && details.burnInEnabled && details.burnInText.isNotBlank()) {
             val alignment = when (details.overlayPosition) {
                 OverlayPosition.TOP_HOOK -> Alignment.TopCenter
@@ -167,6 +172,61 @@ fun StudioVideoPlayer(
                     style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
                     color = Color.White,
                     textAlign = TextAlign.Center
+                )
+            }
+        }
+
+        // Live preview of Bottom Explanation Bar
+        if (details != null && details.bottomExplanationEnabled && details.bottomExplanationText.isNotBlank()) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(horizontal = 16.dp, vertical = 10.dp)
+                    .background(ObsidianBg.copy(alpha = 0.88f), RoundedCornerShape(10.dp))
+                    .border(1.dp, ViralAmber.copy(alpha = 0.9f), RoundedCornerShape(10.dp))
+                    .padding(horizontal = 12.dp, vertical = 5.dp)
+            ) {
+                Text(
+                    text = details.bottomExplanationText,
+                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+                    color = ViralAmber,
+                    textAlign = TextAlign.Center
+                )
+            }
+        }
+
+        // Live preview of Channel Watermark
+        if (details != null && details.watermarkEnabled && details.watermarkText.isNotBlank()) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(10.dp)
+                    .background(ObsidianBg.copy(alpha = 0.72f), RoundedCornerShape(8.dp))
+                    .border(1.dp, StudioBorder, RoundedCornerShape(8.dp))
+                    .padding(horizontal = 8.dp, vertical = 3.dp)
+            ) {
+                Text(
+                    text = details.watermarkText,
+                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFontFamily),
+                    color = Color.White
+                )
+            }
+        }
+
+        // Live preview of Timecode Stamp
+        if (quality?.showTimecodeStamp == true) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(10.dp)
+                    .background(ObsidianBg.copy(alpha = 0.78f), RoundedCornerShape(8.dp))
+                    .border(1.dp, ElectricCyan.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 8.dp, vertical = 3.dp)
+            ) {
+                Text(
+                    text = "TIMECODE",
+                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFontFamily),
+                    color = ElectricCyan
                 )
             }
         }

@@ -30,6 +30,7 @@ import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.AutoFixHigh
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.ContentCut
 import androidx.compose.material.icons.rounded.DeleteOutline
@@ -53,13 +54,13 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.RangeSlider
+import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
 import androidx.compose.material3.TabRowDefaults.SecondaryIndicator
 import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import androidx.compose.material3.Text
@@ -79,6 +80,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.example.model.BitrateTier
+import com.example.model.EditingFeatureId
 import com.example.model.HighlightClip
 import com.example.model.OverlayPosition
 import com.example.model.PacingMode
@@ -124,12 +126,14 @@ fun MontageEditorScreen(
     onApplyQualityPreset: (QualityPreset) -> Unit,
     onUpdateQuality: ((QualitySettings) -> QualitySettings) -> Unit,
     onUpdateDetails: ((VideoDetailsSpec) -> VideoDetailsSpec) -> Unit,
+    onToggleFeature: (EditingFeatureId) -> Unit,
+    onActivateProBundle: () -> Unit,
     onGoToLinkTab: () -> Unit,
     onGoToExportTab: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val tech = uiState.technicalInfo
-    if (tech == null || !File(tech.filePath).exists()) {
+    if (tech == null || (!tech.isRemoteHlsStream && !File(tech.filePath).exists())) {
         Box(
             modifier = modifier
                 .fillMaxSize()
@@ -179,9 +183,10 @@ fun MontageEditorScreen(
     var selectedSubTab by rememberSaveable { mutableIntStateOf(0) }
     val subTabs = listOf(
         "اللقطات المهمة" to Icons.Rounded.ContentCut,
+        "40 ميزة" to Icons.Rounded.AutoFixHigh,
         "الوقت والسرعة" to Icons.Rounded.Speed,
         "تحسين الجودة" to Icons.Rounded.HighQuality,
-        "التفاصيل والنص" to Icons.Rounded.Description
+        "الشرح والتفاصيل" to Icons.Rounded.Description
     )
 
     Box(
@@ -213,15 +218,23 @@ fun MontageEditorScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     TelemetryChip(
-                        label = "اللقطات المختارة",
-                        value = "${uiState.includedClips.size} من ${uiState.clips.size}",
+                        label = "اللقطات",
+                        value = "${uiState.includedClips.size}/${uiState.clips.size}",
                         modifier = Modifier.weight(1f)
                     )
                     TelemetryChip(
-                        label = "المدة بعد المونتاج",
+                        label = "المدة",
                         value = formatMillisTimecode(uiState.estimatedOutputDurationMs),
                         accentColor = ViralAmber,
                         modifier = Modifier.weight(1f)
+                    )
+                    TelemetryChip(
+                        label = "الميزات",
+                        value = "${uiState.activeFeatures.size}/40",
+                        accentColor = EmeraldSuccess,
+                        modifier = Modifier
+                            .weight(1f)
+                            .clickable { selectedSubTab = 1 }
                     )
                     Button(
                         onClick = onGoToExportTab,
@@ -240,10 +253,11 @@ fun MontageEditorScreen(
             }
 
             // Editor Sub-tabs
-            TabRow(
+            ScrollableTabRow(
                 selectedTabIndex = selectedSubTab,
                 containerColor = StudioSurface,
                 contentColor = ElectricCyan,
+                edgePadding = 8.dp,
                 indicator = { tabPositions ->
                     SecondaryIndicator(
                         modifier = Modifier.tabIndicatorOffset(tabPositions[selectedSubTab]),
@@ -285,18 +299,23 @@ fun MontageEditorScreen(
                     onAddCustomClip = onAddCustomClip,
                     onRemoveClip = onRemoveClip
                 )
-                1 -> TimingSpeedEditorTab(
+                1 -> Features40SuiteTab(
+                    uiState = uiState,
+                    onToggleFeature = onToggleFeature,
+                    onActivateProBundle = onActivateProBundle
+                )
+                2 -> TimingSpeedEditorTab(
                     uiState = uiState,
                     originalDurationMs = tech.durationMs,
                     onApplyPacingMode = onApplyPacingMode,
                     onUpdateQuality = onUpdateQuality
                 )
-                2 -> QualityEnhancementTab(
+                3 -> QualityEnhancementTab(
                     quality = uiState.qualitySettings,
                     onApplyPreset = onApplyQualityPreset,
                     onUpdateQuality = onUpdateQuality
                 )
-                3 -> DetailsAndOverlayTab(
+                4 -> DetailsAndOverlayTab(
                     details = uiState.detailsSpec,
                     onUpdateDetails = onUpdateDetails
                 )
@@ -964,7 +983,7 @@ private fun DetailsAndOverlayTab(
                             .testTag("burn_in_text_input")
                     )
 
-                    Text("موضع النص على الشاشة:", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
+                    Text("موضع شارة الهوك:", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -983,6 +1002,60 @@ private fun DetailsAndOverlayTab(
                             )
                         }
                     }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("شريط الشرح أسفل الفيديو", style = MaterialTheme.typography.titleSmall, color = TextPrimary)
+                        Switch(
+                            checked = details.bottomExplanationEnabled,
+                            onCheckedChange = { enabled -> onUpdateDetails { it.copy(bottomExplanationEnabled = enabled) } },
+                            colors = SwitchDefaults.colors(checkedThumbColor = ObsidianBg, checkedTrackColor = ViralAmber)
+                        )
+                    }
+
+                    OutlinedTextField(
+                        value = details.bottomExplanationText,
+                        onValueChange = { txt -> onUpdateDetails { it.copy(bottomExplanationText = txt) } },
+                        label = { Text("نص الشرح المطبوع أسفل الفيديو") },
+                        enabled = details.bottomExplanationEnabled,
+                        singleLine = true,
+                        shape = RoundedCornerShape(12.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = ViralAmber,
+                            unfocusedBorderColor = StudioBorder
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("العلامة المائية للحساب", style = MaterialTheme.typography.titleSmall, color = TextPrimary)
+                        Switch(
+                            checked = details.watermarkEnabled,
+                            onCheckedChange = { enabled -> onUpdateDetails { it.copy(watermarkEnabled = enabled) } },
+                            colors = SwitchDefaults.colors(checkedThumbColor = ObsidianBg, checkedTrackColor = ElectricCyan)
+                        )
+                    }
+
+                    OutlinedTextField(
+                        value = details.watermarkText,
+                        onValueChange = { txt -> onUpdateDetails { it.copy(watermarkText = txt) } },
+                        label = { Text("اسم القناة أو العلامة المائية") },
+                        enabled = details.watermarkEnabled,
+                        singleLine = true,
+                        shape = RoundedCornerShape(12.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = ElectricCyan,
+                            unfocusedBorderColor = StudioBorder
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
                 }
             }
         }
@@ -999,11 +1072,33 @@ private fun DetailsAndOverlayTab(
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     StudioSectionHeader(
-                        title = "كتابة التفاصيل والعنوان والنشر هنا",
-                        subtitle = "جهّز عنوان الجذب والوصف والهاشتاجات وانسخها بضغطة واحدة",
+                        title = "الشرح والسيناريو والتفاصيل هنا",
+                        subtitle = "عناوين مقترحة، سيناريو الشرح الصوتي، الفصول، والوصف الكامل",
                         icon = Icons.Rounded.Description,
                         accent = ViralAmber
                     )
+
+                    if (details.titleHookSuggestions.isNotEmpty()) {
+                        Text("عناوين جذابة مقترحة (اضغط للاختيار):", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            details.titleHookSuggestions.forEach { option ->
+                                FilterChip(
+                                    selected = details.viralTitle == option,
+                                    onClick = { onUpdateDetails { it.copy(viralTitle = option) } },
+                                    label = { Text(option, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = AmberContainer,
+                                        selectedLabelColor = ViralAmber
+                                    )
+                                )
+                            }
+                        }
+                    }
 
                     OutlinedTextField(
                         value = details.viralTitle,
@@ -1020,9 +1115,39 @@ private fun DetailsAndOverlayTab(
                     )
 
                     OutlinedTextField(
+                        value = details.voiceoverScript,
+                        onValueChange = { txt -> onUpdateDetails { it.copy(voiceoverScript = txt) } },
+                        label = { Text("سيناريو الشرح والتعليق الصوتي") },
+                        minLines = 3,
+                        maxLines = 6,
+                        shape = RoundedCornerShape(12.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = ElectricCyan,
+                            unfocusedBorderColor = StudioBorder
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("voiceover_script_input")
+                    )
+
+                    OutlinedTextField(
+                        value = details.chapterTimestamps,
+                        onValueChange = { txt -> onUpdateDetails { it.copy(chapterTimestamps = txt) } },
+                        label = { Text("فهرس التوقيتات والفصول (Chapters)") },
+                        minLines = 2,
+                        maxLines = 5,
+                        shape = RoundedCornerShape(12.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = ElectricCyan,
+                            unfocusedBorderColor = StudioBorder
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    OutlinedTextField(
                         value = details.description,
                         onValueChange = { txt -> onUpdateDetails { it.copy(description = txt) } },
-                        label = { Text("التفاصيل والوصف الكامل للفيديو") },
+                        label = { Text("الشرح التفصيلي والوصف الكامل للفيديو") },
                         minLines = 4,
                         maxLines = 8,
                         shape = RoundedCornerShape(12.dp),
@@ -1053,6 +1178,16 @@ private fun DetailsAndOverlayTab(
                                 appendLine(details.viralTitle)
                                 appendLine()
                                 appendLine(details.description)
+                                if (details.chapterTimestamps.isNotBlank()) {
+                                    appendLine()
+                                    appendLine("الفصول:")
+                                    appendLine(details.chapterTimestamps)
+                                }
+                                if (details.voiceoverScript.isNotBlank()) {
+                                    appendLine()
+                                    appendLine("سيناريو الشرح:")
+                                    appendLine(details.voiceoverScript)
+                                }
                                 appendLine()
                                 append(details.hashtags)
                             }
@@ -1071,7 +1206,7 @@ private fun DetailsAndOverlayTab(
                     ) {
                         Icon(Icons.Rounded.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("نسخ العنوان والتفاصيل والهاشتاجات", fontWeight = FontWeight.Bold)
+                        Text("نسخ العنوان والشرح والسيناريو والفصول", fontWeight = FontWeight.Bold)
                     }
                 }
             }

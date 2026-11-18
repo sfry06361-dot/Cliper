@@ -80,7 +80,7 @@ fun ExportProduceScreen(
     val context = LocalContext.current
     val tech = uiState.technicalInfo
 
-    if (tech == null || !File(tech.filePath).exists()) {
+    if (tech == null || (!tech.isRemoteHlsStream && !File(tech.filePath).exists())) {
         Box(
             modifier = modifier
                 .fillMaxSize()
@@ -184,6 +184,12 @@ fun ExportProduceScreen(
                                 value = uiState.qualitySettings.bitrateTier.labelAr,
                                 modifier = Modifier.weight(1f)
                             )
+                            TelemetryChip(
+                                label = "الميزات",
+                                value = "${uiState.activeFeatures.size} / 40",
+                                accentColor = ViralAmber,
+                                modifier = Modifier.weight(1f)
+                            )
                         }
 
                         if (uiState.detailsSpec.burnInEnabled && uiState.detailsSpec.burnInText.isNotBlank()) {
@@ -191,6 +197,13 @@ fun ExportProduceScreen(
                                 text = "النص المطبوع على الفيديو: \"${uiState.detailsSpec.burnInText}\"",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = ElectricCyan
+                            )
+                        }
+                        if (uiState.detailsSpec.bottomExplanationEnabled && uiState.detailsSpec.bottomExplanationText.isNotBlank()) {
+                            Text(
+                                text = "شريط الشرح السفلي: \"${uiState.detailsSpec.bottomExplanationText}\"",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = ViralAmber
                             )
                         }
 
@@ -404,6 +417,16 @@ fun ExportProduceScreen(
                                             appendLine(uiState.detailsSpec.viralTitle)
                                             appendLine()
                                             appendLine(uiState.detailsSpec.description)
+                                            if (uiState.detailsSpec.chapterTimestamps.isNotBlank()) {
+                                                appendLine()
+                                                appendLine("الفصول:")
+                                                appendLine(uiState.detailsSpec.chapterTimestamps)
+                                            }
+                                            if (uiState.detailsSpec.voiceoverScript.isNotBlank()) {
+                                                appendLine()
+                                                appendLine("سيناريو الشرح:")
+                                                appendLine(uiState.detailsSpec.voiceoverScript)
+                                            }
                                             appendLine()
                                             append(uiState.detailsSpec.hashtags)
                                         }

@@ -323,6 +323,8 @@ fun ClipCraftApp(
                             onApplyQualityPreset = viewModel::applyQualityPreset,
                             onUpdateQuality = viewModel::updateQualitySettings,
                             onUpdateDetails = viewModel::updateDetailsSpec,
+                            onToggleFeature = viewModel::toggleFeature,
+                            onActivateProBundle = viewModel::activateProMontageBundle,
                             onGoToLinkTab = { navigateTo(ClipCraftRoute.StudioLink) },
                             onGoToExportTab = { navigateTo(ClipCraftRoute.ExportProduce) }
                         )

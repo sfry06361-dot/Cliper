@@ -51,21 +51,28 @@ interface HighlightAiAdvisor {
 
 /**
  * Multimodal Gemini 3.8 Flash analyzer via Firebase AI Logic.
- * Inspects sampled keyframes + motion/sharpness telemetry and returns a structured
- * montage plan (viral hook clip first, top highlight cuts, quality preset, pacing speed,
- * burn-in overlay hook, viral Arabic title, description, and hashtags).
+ * Inspects sampled keyframes + motion/sharpness telemetry and generates:
+ * - Viral Hook first + highlight montage cuts
+ * - Full Arabic explanation, voiceover script, timestamped chapters, 3 title hooks, burn-in text, and SEO hashtags
  */
 class GeminiHighlightAdvisor : HighlightAiAdvisor {
 
     private val responseSchema = Schema.obj(
         properties = mapOf(
-            "viralTitle" to Schema.string(description = "Catchy Arabic title optimized to attract views"),
-            "burnInText" to Schema.string(description = "Short punchy Arabic text (3-7 words) to burn directly onto the video"),
-            "description" to Schema.string(description = "Detailed Arabic video description with highlight timestamps and engaging summary"),
+            "viralTitle" to Schema.string(description = "Best catchy Arabic title optimized to attract views"),
+            "titleOptions" to Schema.array(
+                items = Schema.string(),
+                description = "3 distinct high-CTR Arabic title options"
+            ),
+            "burnInText" to Schema.string(description = "Short punchy Arabic hook (3-7 words) to burn on top of video"),
+            "bottomExplanation" to Schema.string(description = "Concise Arabic explanation bar text (5-10 words) summarizing what happens"),
+            "voiceoverScript" to Schema.string(description = "Arabic voiceover explanation script segmented by moment"),
+            "chapterTimestamps" to Schema.string(description = "Timestamped chapters formatted as 00:00 Title per line"),
+            "description" to Schema.string(description = "Detailed Arabic video explanation and summary for publishing"),
             "hashtags" to Schema.string(description = "Space-separated Arabic and English hashtags"),
             "recommendedPreset" to Schema.enumeration(
                 values = listOf("CINEMA_4K", "VIRAL_HDR_PUNCH", "STUDIO_BRIGHT", "ORIGINAL"),
-                description = "Best visual enhancement preset based on lighting and contrast of the frames"
+                description = "Best visual enhancement preset based on lighting and contrast"
             ),
             "recommendedSpeed" to Schema.double(description = "Optimal global playback speed between 0.85 and 1.45"),
             "clips" to Schema.array(
@@ -164,25 +171,31 @@ class GeminiHighlightAdvisor : HighlightAiAdvisor {
         metrics: List<FrameSampleMetric>,
         pacingMode: PacingMode
     ): String {
-        val telemetryLines = metrics.joinToString("\n") { m ->
-            "- t=${m.timestampMs}ms | energy=${(m.combinedEnergy * 100).toInt()}% | motion=${(m.motionDeltaScore * 100).toInt()}% | sharpness=${(m.sharpnessScore * 100).toInt()}% | luma=${(m.lumaScore * 100).toInt()}%"
+        val telemetryLines = if (metrics.isEmpty()) {
+            "- لا توجد إطارات مستخرجة محلياً (بث مباشر)."
+        } else {
+            metrics.joinToString("\n") { m ->
+                "- t=${m.timestampMs}ms | energy=${(m.combinedEnergy * 100).toInt()}% | motion=${(m.motionDeltaScore * 100).toInt()}% | sharpness=${(m.sharpnessScore * 100).toInt()}%"
+            }
         }
         val targetInfo = pacingMode.maxTargetDurationMs?.let { "${it / 1000} ثانية" } ?: "مونتاج شامل لأهم اللقطات"
 
         return """
-            أنت مخرج ومونتير فيديو محترف متخصص في الفيديوهات القصيرة عالية المشاهدات (Reels / Shorts / TikTok).
-            مهمتك فحص إطارات الفيديو المرفقة وبيانات الفحص التقنية، واستخراج خطة مونتاج دقيقة جداً:
-            1. اختر أقوى لقطة افتتاحية (Hook) تجذب الانتباه خلال أول 3 ثوانٍ وضعها أولاً (isHook = true).
-            2. استبعد اللحظات البطيئة أو المملة واجعل اللقطات المهمة والذروة فقط مفعّلة (isIncluded = true) ضمن مدة مستهدفة: $targetInfo.
-            3. التزم تماماً بحدود الفيديو من 0 إلى ${technicalInfo.durationMs} مللي ثانية، واجعل كل لقطة لا تقل عن 1500 مللي ثانية.
-            4. اقترح أفضل إعداد تحسين جودة (recommendedPreset) بناءً على إضاءة وتباين الإطارات التي تراها، والسرعة المناسبة (recommendedSpeed).
-            5. اكتب عنواناً عربياً جذاباً جداً (viralTitle)، ونصاً قصيراً قوياً ليُطبع على الفيديو (burnInText)، وتفاصيل وصفية دقيقة مع التوقيتات (description)، وهاشتاجات قوية (hashtags).
+            أنت مخرج ومونتير فيديو محترف وكاتب سيناريو شرح للفيديوهات القصيرة عالية المشاهدات.
+            قم بفحص إطارات الفيديو وبياناته التقنية وأنشئ خطة مونتاج وشرح كاملة:
+            1. اختر أقوى لقطة افتتاحية (Hook) تجذب المشاهد في أول 3 ثوانٍ (isHook = true) وضعها أولاً.
+            2. استبعد اللحظات البطيئة واجعل اللقطات المهمة فقط مفعّلة (isIncluded = true) ضمن مدة مستهدفة: $targetInfo.
+            3. التزم بحدود الفيديو من 0 إلى ${technicalInfo.durationMs} ms، وكل لقطة لا تقل عن 1500 ms.
+            4. اكتب 3 عناوين عربية جذابة (titleOptions)، واختر أفضلها في viralTitle.
+            5. اكتب جملة هوك قصيرة لطباعتها أعلى الفيديو (burnInText)، وجملة شرح مختصرة أسفل الفيديو (bottomExplanation).
+            6. اكتب سيناريو تعليق صوتي وشرح احترافي (voiceoverScript)، وفهرس فصول بالتوقيت (chapterTimestamps)، والوصف الكامل (description)، والهاشتاجات (hashtags).
+            7. اقترح إعداد الجودة (recommendedPreset) والسرعة (recommendedSpeed).
 
             بيانات الفيديو:
             - العنوان المصدر: $sourceTitle
             - المدة الإجمالية: ${technicalInfo.durationMs} ms
-            - الدقة الأصلية: ${technicalInfo.width}x${technicalInfo.height} (${technicalInfo.fps} fps)
-            - مؤشرات الطاقة للإطارات المفحوصة:
+            - الدقة: ${technicalInfo.width}x${technicalInfo.height} (${technicalInfo.fps} fps)
+            - مؤشرات الإطارات:
             $telemetryLines
         """.trimIndent()
     }
@@ -194,10 +207,23 @@ class GeminiHighlightAdvisor : HighlightAiAdvisor {
         pacingMode: PacingMode
     ): HighlightSuggestionBundle {
         val root = JSONObject(rawJson)
-        val viralTitle = root.optString("viralTitle").ifBlank { "أهم لقطات الفيديو بجودة فائقة" }
+        val viralTitle = root.optString("viralTitle").ifBlank { "أهم لقطات الفيديو مع الشرح الكامل" }
+        val titleOptionsJson = root.optJSONArray("titleOptions")
+        val titleOptions = buildList {
+            if (titleOptionsJson != null) {
+                for (i in 0 until titleOptionsJson.length()) {
+                    titleOptionsJson.optString(i).takeIf { it.isNotBlank() }?.let { add(it) }
+                }
+            }
+        }
         val burnInText = root.optString("burnInText").ifBlank { "شاهد اللحظة الأهم هنا 🔥" }
+        val bottomExplanation = root.optString("bottomExplanation").ifBlank { "ملخص وشرح سريع لأهم لقطات الفيديو" }
+        val voiceoverScript = root.optString("voiceoverScript").ifBlank {
+            "في البداية نرى اللحظة الأبرز، ثم ننتقل مباشرة لأهم التحولات والتفاصيل بدقة عالية."
+        }
+        val chapterTimestamps = root.optString("chapterTimestamps").ifBlank { "00:00 الهوك الافتتاحي\n00:05 اللقطات المهمة" }
         val description = root.optString("description").ifBlank { viralTitle }
-        val hashtags = root.optString("hashtags").ifBlank { "#مونتاج #لقطات_مهمة #ClipCraft" }
+        val hashtags = root.optString("hashtags").ifBlank { "#مونتاج #شرح #لقطات_مهمة #ClipCraft" }
         val presetName = root.optString("recommendedPreset", "VIRAL_HDR_PUNCH")
         val preset = runCatching { QualityPreset.valueOf(presetName) }.getOrDefault(QualityPreset.VIRAL_HDR_PUNCH)
         val recSpeed = root.optDouble("recommendedSpeed", 1.1).toFloat().coerceIn(0.8f, 1.5f)
@@ -235,7 +261,6 @@ class GeminiHighlightAdvisor : HighlightAiAdvisor {
             throw IllegalStateException("لم يرجع Gemini أي لقطات صالحة ضمن مدة الفيديو.")
         }
 
-        // Ensure Hook clip comes first and at least one clip is included
         val hookIdx = parsedClips.indexOfFirst { it.isHook }
         val reordered = if (hookIdx > 0) {
             val list = parsedClips.toMutableList()
@@ -262,16 +287,23 @@ class GeminiHighlightAdvisor : HighlightAiAdvisor {
             clips = finalClips,
             details = VideoDetailsSpec(
                 viralTitle = viralTitle,
+                titleHookSuggestions = titleOptions.ifEmpty { listOf(viralTitle) },
                 burnInEnabled = true,
                 burnInText = burnInText,
                 overlayPosition = OverlayPosition.TOP_HOOK,
+                bottomExplanationEnabled = true,
+                bottomExplanationText = bottomExplanation,
+                watermarkEnabled = false,
+                watermarkText = "@ClipCraft",
+                voiceoverScript = voiceoverScript,
+                chapterTimestamps = chapterTimestamps,
                 description = description,
                 hashtags = hashtags
             ),
             recommendedPreset = preset,
             recommendedSpeed = recSpeed,
             poweredByGemini = true,
-            noticeMessage = "تم التحليل عبر Gemini 3.8 Flash بفحص الإطارات الحقيقية وترتيب أقوى اللقطات لجذب المشاهدات."
+            noticeMessage = "تم التحليل عبر Gemini 3.8 Flash: استخراج اللقطات المهمة، كتابة الشرح والسيناريو، وتجهيز المونتاج."
         )
     }
 

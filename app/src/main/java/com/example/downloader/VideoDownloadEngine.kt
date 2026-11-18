@@ -7,11 +7,13 @@ import com.example.model.LinkInspectionResult
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -27,13 +29,14 @@ data class StoredMediaFile(
 
 /**
  * Self-contained streaming video downloader stored inside the application files.
- * Verifies container magic bytes (MP4/MOV ftyp, WebM/MKV EBML) and persists inside filesDir/downloads.
+ * Peeks initial bytes before writing to disk, auto-recovers if a CDN redirects to HTML,
+ * supports direct HLS (.m3u8) streams, and verifies container magic bytes.
  */
 class VideoDownloadEngine(
     private val context: Context,
     private val linkInspector: VideoLinkInspector = VideoLinkInspector(),
     private val frameInspector: VideoFrameInspector = VideoFrameInspector(context),
-    private val client: OkHttpClient = VideoLinkInspector.defaultOkHttpClient()
+    private val client: OkHttpClient = VideoLinkInspector.sharedOkHttpClient
 ) {
     @Volatile
     private var activeCall: Call? = null
@@ -50,10 +53,35 @@ class VideoDownloadEngine(
     }
 
     fun inspectAndDownload(rawUrl: String): Flow<DownloadState> = flow {
-        emit(DownloadState.Inspecting(rawUrl, "جاري فحص الرابط والاتصال بالخادم..."))
-        val inspection = linkInspector.inspectUrl(rawUrl)
+        emit(DownloadState.Inspecting(rawUrl, "جاري فحص الرابط والتحقق من مسار الفيديو..."))
+        val initialInspection = linkInspector.inspectUrl(rawUrl)
 
-        emit(DownloadState.Inspecting(inspection.resolvedVideoUrl, "جاري بدء تنزيل الفيديو داخل ملفات التطبيق..."))
+        if (initialInspection.isHlsStream) {
+            emit(DownloadState.Verifying(initialInspection))
+            val techInfo = frameInspector.inspectRemoteStream(initialInspection.resolvedVideoUrl, initialInspection.title)
+            emit(
+                DownloadState.Completed(
+                    filePath = initialInspection.resolvedVideoUrl,
+                    inspection = initialInspection,
+                    technicalInfo = techInfo
+                )
+            )
+            return@flow
+        }
+
+        downloadWithRecovery(
+            inspection = initialInspection,
+            referer = initialInspection.originalUrl,
+            allowHtmlRecovery = true
+        )
+    }.flowOn(Dispatchers.IO)
+
+    private suspend fun FlowCollector<DownloadState>.downloadWithRecovery(
+        inspection: LinkInspectionResult,
+        referer: String,
+        allowHtmlRecovery: Boolean
+    ) {
+        emit(DownloadState.Inspecting(inspection.resolvedVideoUrl, "جاري تنزيل الفيديو داخل ملفات التطبيق..."))
 
         val fileId = "clip_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}"
         val ext = guessExtension(inspection.resolvedVideoUrl, inspection.contentType)
@@ -62,15 +90,20 @@ class VideoDownloadEngine(
 
         val request = Request.Builder()
             .url(inspection.resolvedVideoUrl)
-            .header("User-Agent", "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/131.0.0.0 Mobile Safari/537.36")
+            .header("User-Agent", VideoLinkInspector.BROWSER_USER_AGENT)
+            .header("Referer", referer)
+            .header("Accept", "video/*,*/*;q=0.8")
             .get()
             .build()
 
         val call = client.newCall(request)
         activeCall = call
 
+        var recoveredInspection: LinkInspectionResult? = null
+
         try {
             call.execute().use { response ->
+                val finalUrl = response.request.url.toString()
                 if (!response.isSuccessful) {
                     throw VideoLinkException(
                         message = "فشل التنزيل من الخادم (HTTP ${response.code})",
@@ -78,47 +111,112 @@ class VideoDownloadEngine(
                     )
                 }
                 val body = response.body ?: throw VideoLinkException("استجابة الخادم فارغة بدون بيانات فيديو.")
+                val mime = response.header("Content-Type")?.substringBefore(';')?.trim()?.lowercase().orEmpty()
                 val totalBytes = body.contentLength().takeIf { it > 0 } ?: inspection.contentLengthBytes
+                val input = body.byteStream()
 
-                var bytesReadTotal = 0L
+                // Peek first 512 bytes BEFORE streaming to disk so HTML responses never corrupt downloads
+                val peek = ByteArray(512)
+                var peekLen = 0
+                while (peekLen < peek.size) {
+                    val r = input.read(peek, peekLen, peek.size - peekLen)
+                    if (r <= 0) break
+                    peekLen += r
+                }
+                val peekText = String(peek, 0, peekLen, Charsets.ISO_8859_1).trimStart()
+                val isHtmlPayload = mime.contains("text/html") ||
+                    peekText.startsWith("<!doctype", true) ||
+                    peekText.startsWith("<html", true) ||
+                    peekText.startsWith("<head", true) ||
+                    peekText.startsWith("<script", true)
+
+                if (isHtmlPayload) {
+                    if (allowHtmlRecovery) {
+                        val htmlOut = ByteArrayOutputStream()
+                        htmlOut.write(peek, 0, peekLen)
+                        val buf = ByteArray(8192)
+                        while (htmlOut.size() < 512 * 1024) {
+                            val r = input.read(buf)
+                            if (r <= 0) break
+                            htmlOut.write(buf, 0, r)
+                        }
+                        val html = htmlOut.toString(Charsets.UTF_8.name())
+                        val extracted = linkInspector.tryExtractVerifiedVideoFromHtml(html, finalUrl)
+                        if (extracted != null) {
+                            recoveredInspection = extracted
+                            return@use
+                        }
+                    }
+                    throw VideoLinkException(
+                        message = "الموقع أرجع صفحة حماية HTML بدلاً من ملف الفيديو المباشر.",
+                        diagnosticDetail = "تأكد أن الرابط عام (غير خاص أو محمي بحساب) أو اختر ملف الفيديو من جهازك."
+                    )
+                }
+
+                if (peekText.startsWith("#EXTM3U") || mime.contains("mpegurl")) {
+                    val hlsInspection = inspection.copy(
+                        resolvedVideoUrl = finalUrl,
+                        isHlsStream = true,
+                        isDirectVideo = false,
+                        inspectionNotes = "تم التحويل تلقائياً إلى بث HLS جاهز للمعالجة."
+                    )
+                    recoveredInspection = hlsInspection
+                    return@use
+                }
+
+                var bytesReadTotal = peekLen.toLong()
                 var lastEmitTime = System.currentTimeMillis()
                 var bytesSinceLastEmit = 0L
 
-                body.byteStream().use { input ->
-                    FileOutputStream(tempFile).use { output ->
-                        val buffer = ByteArray(16 * 1024)
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read == -1) break
-                            output.write(buffer, 0, read)
-                            bytesReadTotal += read
-                            bytesSinceLastEmit += read
-
-                            val now = System.currentTimeMillis()
-                            val elapsed = now - lastEmitTime
-                            if (elapsed >= 120L) {
-                                val speed = (bytesSinceLastEmit * 1000L) / elapsed.coerceAtLeast(1L)
-                                val percent = if (totalBytes > 0) {
-                                    ((bytesReadTotal * 100L) / totalBytes).toInt().coerceIn(0, 99)
-                                } else {
-                                    0
-                                }
-                                emit(
-                                    DownloadState.Downloading(
-                                        bytesRead = bytesReadTotal,
-                                        totalBytes = totalBytes,
-                                        speedBytesPerSec = speed,
-                                        progressPercent = percent,
-                                        inspection = inspection
-                                    )
-                                )
-                                lastEmitTime = now
-                                bytesSinceLastEmit = 0L
-                            }
-                        }
-                        output.flush()
+                FileOutputStream(tempFile).use { output ->
+                    if (peekLen > 0) {
+                        output.write(peek, 0, peekLen)
                     }
+                    val buffer = ByteArray(16 * 1024)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read == -1) break
+                        output.write(buffer, 0, read)
+                        bytesReadTotal += read
+                        bytesSinceLastEmit += read
+
+                        val now = System.currentTimeMillis()
+                        val elapsed = now - lastEmitTime
+                        if (elapsed >= 120L) {
+                            val speed = (bytesSinceLastEmit * 1000L) / elapsed.coerceAtLeast(1L)
+                            val percent = if (totalBytes > 0) {
+                                ((bytesReadTotal * 100L) / totalBytes).toInt().coerceIn(0, 99)
+                            } else {
+                                0
+                            }
+                            emit(
+                                DownloadState.Downloading(
+                                    bytesRead = bytesReadTotal,
+                                    totalBytes = totalBytes,
+                                    speedBytesPerSec = speed,
+                                    progressPercent = percent,
+                                    inspection = inspection
+                                )
+                            )
+                            lastEmitTime = now
+                            bytesSinceLastEmit = 0L
+                        }
+                    }
+                    output.flush()
                 }
+            }
+
+            // Handle auto-recovered stream (either extracted MP4 from HTML or HLS stream)
+            val rec = recoveredInspection
+            if (rec != null) {
+                if (rec.isHlsStream) {
+                    emit(DownloadState.Verifying(rec))
+                    val techInfo = frameInspector.inspectRemoteStream(rec.resolvedVideoUrl, rec.title)
+                    emit(DownloadState.Completed(rec.resolvedVideoUrl, rec, techInfo))
+                } else {
+                    downloadWithRecovery(rec, referer = inspection.resolvedVideoUrl, allowHtmlRecovery = false)
+                }
+                return
             }
 
             emit(DownloadState.Verifying(inspection))
@@ -154,7 +252,7 @@ class VideoDownloadEngine(
         } finally {
             activeCall = null
         }
-    }.flowOn(Dispatchers.IO)
+    }
 
     fun importLocalUri(uri: Uri): Flow<DownloadState> = flow {
         val inspection = LinkInspectionResult(
@@ -178,12 +276,10 @@ class VideoDownloadEngine(
             inputStream.use { input ->
                 FileOutputStream(targetFile).use { output ->
                     val buffer = ByteArray(16 * 1024)
-                    var copied = 0L
                     while (true) {
                         val read = input.read(buffer)
                         if (read == -1) break
                         output.write(buffer, 0, read)
-                        copied += read
                     }
                     output.flush()
                 }
@@ -219,7 +315,6 @@ class VideoDownloadEngine(
         val isRiff = headerStr.startsWith("RIFF")
         val isTs = header[0] == 0x47.toByte()
         if (!isMp4OrMov && !isEbml && !isRiff && !isTs) {
-            // Final verification via MediaMetadataRetriever in case of non-standard box offset
             val probeOk = runCatching {
                 val retriever = android.media.MediaMetadataRetriever()
                 retriever.setDataSource(file.absolutePath)

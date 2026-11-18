@@ -65,6 +65,23 @@ class VideoFrameInspector(private val context: Context) {
         }
     }
 
+    suspend fun inspectRemoteStream(streamUrl: String, title: String): VideoTechnicalInfo = withContext(Dispatchers.IO) {
+        VideoTechnicalInfo(
+            filePath = streamUrl,
+            fileName = title.ifBlank { "HLS Stream" },
+            fileSizeBytes = 0L,
+            durationMs = 30_000L,
+            width = 1280,
+            height = 720,
+            bitrateBps = 4_000_000L,
+            fps = 30,
+            hasAudio = true,
+            rotationDegrees = 0,
+            mimeType = "application/vnd.apple.mpegurl",
+            isRemoteHlsStream = true
+        )
+    }
+
     suspend fun sampleFramesAndEnergy(
         filePath: String,
         projectId: String,

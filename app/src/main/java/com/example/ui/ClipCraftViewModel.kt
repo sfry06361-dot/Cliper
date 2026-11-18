@@ -15,8 +15,10 @@ import com.example.downloader.StoredMediaFile
 import com.example.downloader.VideoDownloadEngine
 import com.example.downloader.VideoFrameInspector
 import com.example.editor.VideoMontageExporter
+import com.example.model.AspectRatioMode
 import com.example.model.BitrateTier
 import com.example.model.DownloadState
+import com.example.model.EditingFeatureId
 import com.example.model.ExportState
 import com.example.model.FrameSampleMetric
 import com.example.model.HighlightClip
@@ -25,8 +27,10 @@ import com.example.model.PacingMode
 import com.example.model.QualityPreset
 import com.example.model.QualitySettings
 import com.example.model.TargetResolution
+import com.example.model.VideoCodecMode
 import com.example.model.VideoDetailsSpec
 import com.example.model.VideoTechnicalInfo
+import com.example.ui.components.formatMillisTimecode
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -60,15 +64,87 @@ data class StudioUiState(
         get() = aiAnalysisState is AiAnalysisState.Analyzing
 
     val hasLoadedVideo: Boolean
-        get() = technicalInfo != null && File(technicalInfo.filePath).exists()
+        get() = technicalInfo != null &&
+            (technicalInfo.isRemoteHlsStream || File(technicalInfo.filePath).exists())
 
     val includedClips: List<HighlightClip>
         get() = clips.filter { it.isIncluded }
 
     val estimatedOutputDurationMs: Long
-        get() = includedClips.sumOf {
-            (it.rawDurationMs / (it.speedMultiplier * qualitySettings.globalSpeed).coerceIn(0.5f, 2.5f)).toLong()
+        get() {
+            val base = includedClips
+            val active = if (qualitySettings.top3Only) base.take(3) else base
+            val totalClipMs = active.sumOf { clip ->
+                val trim = qualitySettings.jumpCutTrimMs.coerceIn(0L, 400L)
+                val trimmedRaw = (clip.rawDurationMs - trim * 2L).coerceAtLeast(500L)
+                (trimmedRaw / (clip.speedMultiplier * qualitySettings.globalSpeed).coerceIn(0.5f, 2.5f)).toLong()
+            }
+            val hookExtraMs = if (qualitySettings.loopHookAtEnd && active.isNotEmpty()) {
+                val hook = active.firstOrNull { it.isHook } ?: active.first()
+                (hook.rawDurationMs / (hook.speedMultiplier * qualitySettings.globalSpeed).coerceIn(0.5f, 2.5f)).toLong()
+            } else {
+                0L
+            }
+            val outroExtraMs = if (qualitySettings.includeOutroCta) 2200L else 0L
+            return totalClipMs + hookExtraMs + outroExtraMs
         }
+
+    val activeFeatures: Set<EditingFeatureId>
+        get() = computeActiveFeatures(this)
+}
+
+fun computeActiveFeatures(state: StudioUiState): Set<EditingFeatureId> {
+    if (!state.hasLoadedVideo) return emptySet()
+    val q = state.qualitySettings
+    val d = state.detailsSpec
+    val clips = state.clips
+
+    return buildSet {
+        if (clips.firstOrNull()?.isHook == true) add(EditingFeatureId.F01_AUTO_HOOK_FIRST)
+        if (clips.size > 1 && clips.any { !it.isIncluded }) add(EditingFeatureId.F02_DEAD_AIR_TRIM)
+        if (q.loopHookAtEnd) add(EditingFeatureId.F03_HOOK_LOOP_REPLAY)
+        if (q.jumpCutTrimMs > 0L) add(EditingFeatureId.F04_JUMP_CUT_TIGHTENER)
+        if (q.top3Only) add(EditingFeatureId.F05_TOP_3_HIGHLIGHTS)
+        if (q.aspectRatioMode == AspectRatioMode.PORTRAIT_9_16) add(EditingFeatureId.F06_ASPECT_REELS_9_16)
+        if (state.aiAnalysisState is AiAnalysisState.Success) add(EditingFeatureId.F07_GEMINI_STORY_ARC)
+        if (q.includeOutroCta) add(EditingFeatureId.F08_OUTRO_CTA_CARD)
+
+        if (d.description.isNotBlank()) add(EditingFeatureId.F09_AI_FULL_EXPLANATION)
+        if (d.voiceoverScript.isNotBlank()) add(EditingFeatureId.F10_VOICEOVER_SCRIPT)
+        if (d.chapterTimestamps.isNotBlank()) add(EditingFeatureId.F11_CHAPTER_TIMESTAMPS)
+        if (d.viralTitle.isNotBlank()) add(EditingFeatureId.F12_VIRAL_TITLE_HOOKS)
+        if (d.bottomExplanationEnabled && d.bottomExplanationText.isNotBlank()) add(EditingFeatureId.F13_BURN_IN_EXPLANATION)
+        if (d.burnInEnabled && d.burnInText.isNotBlank()) add(EditingFeatureId.F14_TOP_HOOK_BANNER)
+        if (d.watermarkEnabled && d.watermarkText.isNotBlank()) add(EditingFeatureId.F15_CHANNEL_WATERMARK)
+        if (d.hashtags.isNotBlank()) add(EditingFeatureId.F16_SEO_HASHTAGS)
+
+        if (q.globalSpeed in 1.08f..1.35f) add(EditingFeatureId.F17_REELS_SPEED_1_15)
+        if (q.globalSpeed <= 0.85f) add(EditingFeatureId.F18_CINEMATIC_SLOWMO)
+        if (q.pacingMode == PacingMode.SHORT_15S) add(EditingFeatureId.F19_SHORTS_15S_CAP)
+        if (q.pacingMode == PacingMode.REEL_30S) add(EditingFeatureId.F20_TIKTOK_30S_CAP)
+        if (q.pacingMode == PacingMode.SUMMARY_60S) add(EditingFeatureId.F21_SUMMARY_60S_CAP)
+        if (q.globalSpeed >= 1.45f) add(EditingFeatureId.F22_HYPER_TIMELAPSE)
+        if (q.pitchPreserved) add(EditingFeatureId.F23_PITCH_PRESERVED)
+        if (q.showTimecodeStamp) add(EditingFeatureId.F24_TIMECODE_STAMP)
+
+        if (q.targetResolution == TargetResolution.HD_1080P) add(EditingFeatureId.F25_UPSCALE_1080P)
+        if (q.targetResolution == TargetResolution.UHD_4K) add(EditingFeatureId.F26_UPSCALE_4K)
+        if (q.bitrateTier == BitrateTier.ULTRA_16M) add(EditingFeatureId.F27_ULTRA_BITRATE_16M)
+        if (q.contrast >= 0.14f) add(EditingFeatureId.F28_HDR_CONTRAST_PUNCH)
+        if (q.brightness >= 0.04f) add(EditingFeatureId.F29_STUDIO_BRIGHT_LIFT)
+        if (q.saturation >= 12f && !q.noirMode) add(EditingFeatureId.F30_COLOR_VIBRANCE)
+        if (q.warmth >= 0.03f && !q.noirMode) add(EditingFeatureId.F31_CINEMA_WARMTH)
+        if (q.noirMode) add(EditingFeatureId.F32_NOIR_MONOCHROME)
+
+        if (q.rotationDegrees != 0f) add(EditingFeatureId.F33_ROTATE_90)
+        if (q.mirrorHorizontal) add(EditingFeatureId.F34_MIRROR_FLIP)
+        if (q.zoomScale > 1.05f) add(EditingFeatureId.F35_DYNAMIC_PUNCH_ZOOM)
+        if (q.moodyDarkMode) add(EditingFeatureId.F36_MOODY_DARK_TONE)
+        if (q.targetFps >= 60) add(EditingFeatureId.F37_SMOOTH_60FPS)
+        if (q.removeAudio) add(EditingFeatureId.F38_MUTE_B_ROLL)
+        if (q.codecMode == VideoCodecMode.H265_HEVC) add(EditingFeatureId.F39_CODEC_HEVC_H265)
+        if (q.autoSaveToGallery) add(EditingFeatureId.F40_AUTO_SAVE_GALLERY)
+    }
 }
 
 class ClipCraftViewModel(application: Application) : AndroidViewModel(application) {
@@ -168,12 +244,16 @@ class ClipCraftViewModel(application: Application) : AndroidViewModel(applicatio
                 )
             }
             val projectId = _uiState.value.projectId
-            val metrics = frameInspector.sampleFramesAndEnergy(
-                filePath = technicalInfo.filePath,
-                projectId = projectId,
-                durationMs = technicalInfo.durationMs,
-                sampleCount = 12
-            )
+            val metrics = if (technicalInfo.isRemoteHlsStream) {
+                emptyList()
+            } else {
+                frameInspector.sampleFramesAndEnergy(
+                    filePath = technicalInfo.filePath,
+                    projectId = projectId,
+                    durationMs = technicalInfo.durationMs,
+                    sampleCount = 12
+                )
+            }
             _uiState.update {
                 it.copy(
                     frameMetrics = metrics,
@@ -195,8 +275,10 @@ class ClipCraftViewModel(application: Application) : AndroidViewModel(applicatio
         analysisJob?.cancel()
         analysisJob = viewModelScope.launch {
             _uiState.update { it.copy(aiAnalysisState = AiAnalysisState.Analyzing) }
-            val metrics = _uiState.value.frameMetrics.ifEmpty {
-                frameInspector.sampleFramesAndEnergy(tech.filePath, _uiState.value.projectId, tech.durationMs)
+            val metrics = when {
+                tech.isRemoteHlsStream -> emptyList()
+                _uiState.value.frameMetrics.isNotEmpty() -> _uiState.value.frameMetrics
+                else -> frameInspector.sampleFramesAndEnergy(tech.filePath, _uiState.value.projectId, tech.durationMs)
             }
             _uiState.update { it.copy(frameMetrics = metrics) }
             runGeminiHighlightAnalysis(
@@ -226,7 +308,7 @@ class ClipCraftViewModel(application: Application) : AndroidViewModel(applicatio
                     detailsSpec = bundle.details,
                     qualitySettings = it.qualitySettings.copy(globalSpeed = bundle.recommendedSpeed),
                     aiAnalysisState = AiAnalysisState.Success(bundle.noticeMessage),
-                    toastMessage = "تم استخراج ${bundle.clips.count { c -> c.isIncluded }} لقطات مهمة وكتابة التفاصيل عبر Gemini"
+                    toastMessage = "تم استخراج ${bundle.clips.count { c -> c.isIncluded }} لقطات مهمة وتجهيز الشرح والمونتاج عبر Gemini"
                 )
             }
             persistCurrentProject(exportedPath = null)
@@ -234,7 +316,6 @@ class ClipCraftViewModel(application: Application) : AndroidViewModel(applicatio
             throw e
         } catch (e: Exception) {
             Log.e(TAG, "Gemini AI analysis failed", e)
-            // Surface real error transparently and provide base editable clip range so user isn't blocked from manual editing
             val fallbackSingleClip = if (_uiState.value.clips.isEmpty()) {
                 listOf(
                     HighlightClip(
@@ -258,10 +339,300 @@ class ClipCraftViewModel(application: Application) : AndroidViewModel(applicatio
                     aiAnalysisState = AiAnalysisState.Error(
                         e.localizedMessage ?: "فشل الاتصال بـ Gemini AI Logic."
                     ),
-                    toastMessage = "تعذر تحليل Gemini — راجع تفاصيل الخطأ في شاشة المونتاج"
+                    toastMessage = "تعذر تحليل Gemini — يمكنك التحرير يدوياً أو إعادة المحاولة"
                 )
             }
             persistCurrentProject(exportedPath = null)
+        }
+    }
+
+    fun toggleFeature(feature: EditingFeatureId) {
+        val state = _uiState.value
+        if (!state.hasLoadedVideo) return
+        val currentlyActive = feature in state.activeFeatures
+
+        when (feature) {
+            EditingFeatureId.F01_AUTO_HOOK_FIRST -> {
+                val sorted = state.clips.sortedByDescending { it.viralityScore }
+                val updated = sorted.mapIndexed { idx, clip ->
+                    clip.copy(isHook = idx == 0, isIncluded = if (idx == 0) true else clip.isIncluded)
+                }
+                _uiState.update { it.copy(clips = updated) }
+            }
+            EditingFeatureId.F02_DEAD_AIR_TRIM -> {
+                if (currentlyActive) {
+                    _uiState.update { s -> s.copy(clips = s.clips.map { it.copy(isIncluded = true) }) }
+                } else {
+                    if (state.clips.size > 1) {
+                        val cutoff = (state.clips.size * 0.7f).toInt().coerceAtLeast(1)
+                        val rankedIds = state.clips.sortedByDescending { it.viralityScore }.take(cutoff).map { it.id }.toSet()
+                        _uiState.update { s ->
+                            s.copy(clips = s.clips.map { it.copy(isIncluded = it.id in rankedIds || it.isHook) })
+                        }
+                    } else {
+                        val tech = state.technicalInfo ?: return
+                        val dur = tech.durationMs
+                        if (dur > 4000L) {
+                            val hook = HighlightClip(
+                                id = UUID.randomUUID().toString(),
+                                title = "الهوك السريع",
+                                reason = "أول 3 ثوانٍ جذابة",
+                                viralityScore = 94,
+                                startMs = 0L,
+                                endMs = (dur / 3L).coerceAtLeast(1500L),
+                                isIncluded = true,
+                                isHook = true,
+                                thumbnailPath = state.frameMetrics.firstOrNull()?.thumbnailPath
+                            )
+                            val midFiller = HighlightClip(
+                                id = UUID.randomUUID().toString(),
+                                title = "فترة انتقالية بطيئة",
+                                reason = "تم استبعادها لرفع الإيقاع",
+                                viralityScore = 52,
+                                startMs = dur / 3L,
+                                endMs = (dur * 2L) / 3L,
+                                isIncluded = false,
+                                isHook = false,
+                                thumbnailPath = state.frameMetrics.getOrNull(state.frameMetrics.size / 2)?.thumbnailPath
+                            )
+                            val climax = HighlightClip(
+                                id = UUID.randomUUID().toString(),
+                                title = "ذروة المشهد الأهم",
+                                reason = "أقوى لقطة ختامية",
+                                viralityScore = 96,
+                                startMs = (dur * 2L) / 3L,
+                                endMs = dur,
+                                isIncluded = true,
+                                isHook = false,
+                                thumbnailPath = state.frameMetrics.lastOrNull()?.thumbnailPath
+                            )
+                            _uiState.update { it.copy(clips = listOf(hook, midFiller, climax)) }
+                        }
+                    }
+                }
+            }
+            EditingFeatureId.F03_HOOK_LOOP_REPLAY ->
+                updateQualitySettings { it.copy(loopHookAtEnd = !currentlyActive) }
+            EditingFeatureId.F04_JUMP_CUT_TIGHTENER ->
+                updateQualitySettings { it.copy(jumpCutTrimMs = if (currentlyActive) 0L else 250L) }
+            EditingFeatureId.F05_TOP_3_HIGHLIGHTS ->
+                updateQualitySettings { it.copy(top3Only = !currentlyActive) }
+            EditingFeatureId.F06_ASPECT_REELS_9_16 ->
+                updateQualitySettings {
+                    it.copy(aspectRatioMode = if (currentlyActive) AspectRatioMode.ORIGINAL else AspectRatioMode.PORTRAIT_9_16)
+                }
+            EditingFeatureId.F07_GEMINI_STORY_ARC -> reAnalyzeHighlights()
+            EditingFeatureId.F08_OUTRO_CTA_CARD ->
+                updateQualitySettings { it.copy(includeOutroCta = !currentlyActive) }
+
+            EditingFeatureId.F09_AI_FULL_EXPLANATION -> {
+                if (currentlyActive) {
+                    updateDetailsSpec { it.copy(description = "") }
+                } else {
+                    val generated = buildFallbackExplanation(state)
+                    updateDetailsSpec { it.copy(description = generated) }
+                }
+            }
+            EditingFeatureId.F10_VOICEOVER_SCRIPT -> {
+                if (currentlyActive) {
+                    updateDetailsSpec { it.copy(voiceoverScript = "") }
+                } else {
+                    val script = buildFallbackVoiceover(state)
+                    updateDetailsSpec { it.copy(voiceoverScript = script) }
+                }
+            }
+            EditingFeatureId.F11_CHAPTER_TIMESTAMPS -> {
+                if (currentlyActive) {
+                    updateDetailsSpec { it.copy(chapterTimestamps = "") }
+                } else {
+                    val chapters = buildChaptersFromClips(state.clips)
+                    updateDetailsSpec { it.copy(chapterTimestamps = chapters) }
+                }
+            }
+            EditingFeatureId.F12_VIRAL_TITLE_HOOKS -> {
+                if (currentlyActive) {
+                    updateDetailsSpec { it.copy(viralTitle = "") }
+                } else {
+                    val baseTitle = state.inspectionResult?.title?.ifBlank { "أهم اللقطات" } ?: "أهم اللقطات"
+                    val hooks = state.detailsSpec.titleHookSuggestions.ifEmpty {
+                        listOf(
+                            "أقوى لحظة في $baseTitle 🔥",
+                            "ملخص وشرح $baseTitle في ثوانٍ ⚡",
+                            "لن تصدق ما حدث في $baseTitle!"
+                        )
+                    }
+                    updateDetailsSpec {
+                        it.copy(
+                            viralTitle = hooks.first(),
+                            titleHookSuggestions = hooks
+                        )
+                    }
+                }
+            }
+            EditingFeatureId.F13_BURN_IN_EXPLANATION ->
+                updateDetailsSpec {
+                    it.copy(
+                        bottomExplanationEnabled = !currentlyActive,
+                        bottomExplanationText = it.bottomExplanationText.ifBlank {
+                            it.viralTitle.ifBlank { "ملخص وشرح أهم اللقطات" }
+                        }
+                    )
+                }
+            EditingFeatureId.F14_TOP_HOOK_BANNER ->
+                updateDetailsSpec {
+                    it.copy(
+                        burnInEnabled = !currentlyActive,
+                        burnInText = it.burnInText.ifBlank { "شاهد اللحظة الأهم 🔥" }
+                    )
+                }
+            EditingFeatureId.F15_CHANNEL_WATERMARK ->
+                updateDetailsSpec {
+                    it.copy(
+                        watermarkEnabled = !currentlyActive,
+                        watermarkText = it.watermarkText.ifBlank { "@ClipCraft" }
+                    )
+                }
+            EditingFeatureId.F16_SEO_HASHTAGS ->
+                updateDetailsSpec {
+                    it.copy(hashtags = if (currentlyActive) "" else "#مونتاج #شرح #لقطات_مهمة #رييلز #ClipCraft")
+                }
+
+            EditingFeatureId.F17_REELS_SPEED_1_15 ->
+                updateQualitySettings { it.copy(globalSpeed = if (currentlyActive) 1.0f else 1.15f) }
+            EditingFeatureId.F18_CINEMATIC_SLOWMO ->
+                updateQualitySettings { it.copy(globalSpeed = if (currentlyActive) 1.0f else 0.70f) }
+            EditingFeatureId.F19_SHORTS_15S_CAP ->
+                applyPacingMode(if (currentlyActive) PacingMode.FULL_HIGHLIGHTS else PacingMode.SHORT_15S)
+            EditingFeatureId.F20_TIKTOK_30S_CAP ->
+                applyPacingMode(if (currentlyActive) PacingMode.FULL_HIGHLIGHTS else PacingMode.REEL_30S)
+            EditingFeatureId.F21_SUMMARY_60S_CAP ->
+                applyPacingMode(if (currentlyActive) PacingMode.FULL_HIGHLIGHTS else PacingMode.SUMMARY_60S)
+            EditingFeatureId.F22_HYPER_TIMELAPSE ->
+                updateQualitySettings { it.copy(globalSpeed = if (currentlyActive) 1.0f else 1.60f) }
+            EditingFeatureId.F23_PITCH_PRESERVED ->
+                updateQualitySettings { it.copy(pitchPreserved = !currentlyActive) }
+            EditingFeatureId.F24_TIMECODE_STAMP ->
+                updateQualitySettings { it.copy(showTimecodeStamp = !currentlyActive) }
+
+            EditingFeatureId.F25_UPSCALE_1080P ->
+                updateQualitySettings {
+                    it.copy(targetResolution = if (currentlyActive) TargetResolution.ORIGINAL else TargetResolution.HD_1080P)
+                }
+            EditingFeatureId.F26_UPSCALE_4K ->
+                updateQualitySettings {
+                    it.copy(targetResolution = if (currentlyActive) TargetResolution.HD_1080P else TargetResolution.UHD_4K)
+                }
+            EditingFeatureId.F27_ULTRA_BITRATE_16M ->
+                updateQualitySettings {
+                    it.copy(bitrateTier = if (currentlyActive) BitrateTier.HIGH_8M else BitrateTier.ULTRA_16M)
+                }
+            EditingFeatureId.F28_HDR_CONTRAST_PUNCH ->
+                updateQualitySettings { it.copy(contrast = if (currentlyActive) 0f else 0.22f) }
+            EditingFeatureId.F29_STUDIO_BRIGHT_LIFT ->
+                updateQualitySettings { it.copy(brightness = if (currentlyActive) 0f else 0.10f) }
+            EditingFeatureId.F30_COLOR_VIBRANCE ->
+                updateQualitySettings {
+                    it.copy(
+                        saturation = if (currentlyActive) 0f else 22f,
+                        noirMode = false
+                    )
+                }
+            EditingFeatureId.F31_CINEMA_WARMTH ->
+                updateQualitySettings {
+                    it.copy(
+                        warmth = if (currentlyActive) 0f else 0.08f,
+                        noirMode = false
+                    )
+                }
+            EditingFeatureId.F32_NOIR_MONOCHROME ->
+                updateQualitySettings { it.copy(noirMode = !currentlyActive) }
+
+            EditingFeatureId.F33_ROTATE_90 ->
+                updateQualitySettings { it.copy(rotationDegrees = if (currentlyActive) 0f else 90f) }
+            EditingFeatureId.F34_MIRROR_FLIP ->
+                updateQualitySettings { it.copy(mirrorHorizontal = !currentlyActive) }
+            EditingFeatureId.F35_DYNAMIC_PUNCH_ZOOM ->
+                updateQualitySettings { it.copy(zoomScale = if (currentlyActive) 1.0f else 1.12f) }
+            EditingFeatureId.F36_MOODY_DARK_TONE ->
+                updateQualitySettings { it.copy(moodyDarkMode = !currentlyActive) }
+            EditingFeatureId.F37_SMOOTH_60FPS ->
+                updateQualitySettings { it.copy(targetFps = if (currentlyActive) 30 else 60) }
+            EditingFeatureId.F38_MUTE_B_ROLL ->
+                updateQualitySettings { it.copy(removeAudio = !currentlyActive) }
+            EditingFeatureId.F39_CODEC_HEVC_H265 ->
+                updateQualitySettings {
+                    it.copy(codecMode = if (currentlyActive) VideoCodecMode.H264_COMPAT else VideoCodecMode.H265_HEVC)
+                }
+            EditingFeatureId.F40_AUTO_SAVE_GALLERY ->
+                updateQualitySettings { it.copy(autoSaveToGallery = !currentlyActive) }
+        }
+    }
+
+    fun activateProMontageBundle() {
+        val state = _uiState.value
+        if (!state.hasLoadedVideo) return
+        val updatedQuality = state.qualitySettings.copy(
+            preset = QualityPreset.VIRAL_HDR_PUNCH,
+            targetResolution = TargetResolution.HD_1080P,
+            bitrateTier = BitrateTier.ULTRA_16M,
+            contrast = 0.22f,
+            brightness = 0.06f,
+            saturation = 22f,
+            warmth = 0.05f,
+            globalSpeed = 1.15f,
+            jumpCutTrimMs = 200L,
+            loopHookAtEnd = true,
+            includeOutroCta = true,
+            showTimecodeStamp = true,
+            targetFps = 60,
+            pitchPreserved = true,
+            autoSaveToGallery = true,
+            noirMode = false
+        )
+        val updatedDetails = state.detailsSpec.copy(
+            viralTitle = state.detailsSpec.viralTitle.ifBlank {
+                "ملخص وأقوى لقطات: ${state.inspectionResult?.title ?: "الفيديو"}"
+            },
+            burnInEnabled = true,
+            burnInText = state.detailsSpec.burnInText.ifBlank { "شاهد أهم اللقطات والشرح 🔥" },
+            bottomExplanationEnabled = true,
+            bottomExplanationText = state.detailsSpec.bottomExplanationText.ifBlank {
+                "شرح سريع ومونتاج احترافي لأبرز المشاهد"
+            },
+            watermarkEnabled = true,
+            watermarkText = state.detailsSpec.watermarkText.ifBlank { "@ClipCraft" },
+            voiceoverScript = state.detailsSpec.voiceoverScript.ifBlank { buildFallbackVoiceover(state) },
+            chapterTimestamps = state.detailsSpec.chapterTimestamps.ifBlank { buildChaptersFromClips(state.clips) },
+            description = state.detailsSpec.description.ifBlank { buildFallbackExplanation(state) },
+            hashtags = state.detailsSpec.hashtags.ifBlank { "#مونتاج #شرح #لقطات_مهمة #رييلز #ClipCraft" }
+        )
+        _uiState.update {
+            it.copy(
+                qualitySettings = updatedQuality,
+                detailsSpec = updatedDetails,
+                toastMessage = "تم تفعيل باقة المونتاج والشرح الشاملة (${computeActiveFeatures(it.copy(qualitySettings = updatedQuality, detailsSpec = updatedDetails)).size}/40 ميزة)"
+            )
+        }
+    }
+
+    private fun buildFallbackExplanation(state: StudioUiState): String {
+        val title = state.inspectionResult?.title ?: state.technicalInfo?.fileName ?: "الفيديو"
+        val clipSummaries = state.clips.filter { it.isIncluded }.mapIndexed { i, c ->
+            "${i + 1}. ${c.title}: ${c.reason}"
+        }.joinToString("\n")
+        return "شرح تفصيلي لمونتاج ($title):\n$clipSummaries"
+    }
+
+    private fun buildFallbackVoiceover(state: StudioUiState): String {
+        return state.clips.filter { it.isIncluded }.mapIndexed { idx, c ->
+            "[${formatMillisTimecode(c.startMs)}] لقطة ${idx + 1} (${c.title}): ${c.reason}"
+        }.joinToString("\n")
+    }
+
+    private fun buildChaptersFromClips(clips: List<HighlightClip>): String {
+        if (clips.isEmpty()) return "00:00 الهوك الافتتاحي"
+        return clips.filter { it.isIncluded }.joinToString("\n") { c ->
+            "${formatMillisTimecode(c.startMs).substringBefore('.')} ${c.title}"
         }
     }
 
@@ -378,7 +749,9 @@ class ClipCraftViewModel(application: Application) : AndroidViewModel(applicatio
                     contrast = 0f,
                     brightness = 0f,
                     saturation = 0f,
-                    warmth = 0f
+                    warmth = 0f,
+                    noirMode = false,
+                    moodyDarkMode = false
                 )
                 QualityPreset.CINEMA_4K -> state.qualitySettings.copy(
                     preset = preset,
@@ -387,7 +760,8 @@ class ClipCraftViewModel(application: Application) : AndroidViewModel(applicatio
                     contrast = 0.22f,
                     brightness = -0.02f,
                     saturation = 12f,
-                    warmth = 0.06f
+                    warmth = 0.06f,
+                    noirMode = false
                 )
                 QualityPreset.VIRAL_HDR_PUNCH -> state.qualitySettings.copy(
                     preset = preset,
@@ -396,7 +770,8 @@ class ClipCraftViewModel(application: Application) : AndroidViewModel(applicatio
                     contrast = 0.18f,
                     brightness = 0.04f,
                     saturation = 22f,
-                    warmth = 0.03f
+                    warmth = 0.03f,
+                    noirMode = false
                 )
                 QualityPreset.STUDIO_BRIGHT -> state.qualitySettings.copy(
                     preset = preset,
@@ -405,7 +780,8 @@ class ClipCraftViewModel(application: Application) : AndroidViewModel(applicatio
                     contrast = 0.10f,
                     brightness = 0.12f,
                     saturation = 8f,
-                    warmth = -0.02f
+                    warmth = -0.02f,
+                    noirMode = false
                 )
             }
             state.copy(qualitySettings = updated)
@@ -422,7 +798,7 @@ class ClipCraftViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun startExport() {
         val tech = _uiState.value.technicalInfo
-        if (tech == null || !File(tech.filePath).exists()) {
+        if (tech == null || (!tech.isRemoteHlsStream && !File(tech.filePath).exists())) {
             _uiState.update { it.copy(toastMessage = "قم بتحميل أو اختيار فيديو أولاً") }
             return
         }
@@ -468,12 +844,18 @@ class ClipCraftViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun loadSavedProject(project: SavedProject) {
         viewModelScope.launch {
+            val isRemote = project.downloadedFilePath.startsWith("http://", true) ||
+                project.downloadedFilePath.startsWith("https://", true)
             val file = File(project.downloadedFilePath)
-            if (!file.exists()) {
+            if (!isRemote && !file.exists()) {
                 _uiState.update { it.copy(toastMessage = "ملف الفيديو الأصلي غير موجود في التخزين") }
                 return@launch
             }
-            val tech = frameInspector.inspectVideoFile(project.downloadedFilePath)
+            val tech = if (isRemote) {
+                frameInspector.inspectRemoteStream(project.downloadedFilePath, project.title)
+            } else {
+                frameInspector.inspectVideoFile(project.downloadedFilePath)
+            }
             val exportState = project.exportedFilePath?.let { outPath ->
                 val outFile = File(outPath)
                 if (outFile.exists()) {
@@ -500,8 +882,9 @@ class ClipCraftViewModel(application: Application) : AndroidViewModel(applicatio
                         title = project.title,
                         contentType = tech.mimeType,
                         contentLengthBytes = tech.fileSizeBytes,
-                        isDirectVideo = true,
-                        extractedFromHtml = false
+                        isDirectVideo = !isRemote,
+                        extractedFromHtml = false,
+                        isHlsStream = isRemote
                     ),
                     clips = project.clips,
                     qualitySettings = project.quality,
@@ -510,7 +893,16 @@ class ClipCraftViewModel(application: Application) : AndroidViewModel(applicatio
                     aiAnalysisState = AiAnalysisState.Success("تم تحميل خطة المونتاج المحفوظة"),
                     downloadState = DownloadState.Completed(
                         project.downloadedFilePath,
-                        LinkInspectionResult(project.sourceUrl, project.sourceUrl, project.title, tech.mimeType, tech.fileSizeBytes, true, false),
+                        LinkInspectionResult(
+                            project.sourceUrl,
+                            project.sourceUrl,
+                            project.title,
+                            tech.mimeType,
+                            tech.fileSizeBytes,
+                            isDirectVideo = !isRemote,
+                            extractedFromHtml = false,
+                            isHlsStream = isRemote
+                        ),
                         tech
                     ),
                     toastMessage = "تم فتح المشروع: ${project.title}"
