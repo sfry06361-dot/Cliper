@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">ClipCraft</string>
+    <string name="studio_title_ar">كليب كرافت</string>
+    <string name="studio_subtitle_ar">استوديو الفحص والتحميل والمونتاج الذكي</string>
+    <string name="nav_studio">الرابط والفحص</string>
+    <string name="nav_editor">المونتاج والجودة</string>
+    <string name="nav_export">الإنتاج والتصدير</string>
+    <string name="nav_projects">المشاريع والملفات</string>
+</resources>

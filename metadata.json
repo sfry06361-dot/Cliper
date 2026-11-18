@@ -1,0 +1,6 @@
+{
+  "name": "ClipCraft",
+  "description": "Smart video link downloader, quality enhancer, AI highlight detector, and precision montage editor.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
